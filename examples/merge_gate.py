@@ -150,7 +150,7 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
         residue = residue.replace(phrase, " ")
     # Findings anywhere in the receipt beat a clean verdict token: the token is a summary, the list is the
     # evidence that something is left.
-    if any(p in residue for p in policy.finding_phrases):
+    if _has_finding(residue, policy.finding_phrases):
         return "findings"
     if tokens:
         return tokens[-1]
@@ -161,6 +161,18 @@ def rendered(text: str) -> str:
     """The words Markdown renders: escapes undone, emphasis and code marks dropped (`Draft\\:` reads `Draft:`, and
     `do **not** merge` reads `do not merge`), so formatting never hides a hold marker (#28)."""
     return MD_MARKS.sub("", MD_ESCAPE.sub(r"\1", text or ""))
+
+
+def _has_finding(text: str, phrases) -> bool:
+    """A finding phrase in text. Words match as substrings ("issues", "suggested"); a severity marker such as p3 is
+    a standalone token, so MP3, MP4 or HTTP3 is not a finding (Codex on #30)."""
+    for phrase in phrases:
+        if re.fullmatch(r"p\d", phrase):
+            if re.search(rf"(?<![\w-]){phrase}(?!\w)", text):  # p2-yellow (a badge) still counts
+                return True
+        elif phrase in text:
+            return True
+    return False
 
 
 def review_problem(pr: PR, policy: Policy) -> str | None:

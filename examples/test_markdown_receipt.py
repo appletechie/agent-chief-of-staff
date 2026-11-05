@@ -31,6 +31,12 @@ class ReceiptMarkdown(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual(decide(body), "REPORT")
 
+    def test_a_severity_marker_is_a_token_not_part_of_a_word(self):
+        # Codex on #30: MP3, MP4 and HTTP3 are not P3/P4 findings; a bare P2 still is.
+        self.assertEqual(decide("No major issues found. Validated MP3 and MP4 playback over HTTP3."), "MERGE")
+        self.assertEqual(decide("verdict: clean\nP2 retry loop never ends"), "REPORT")
+        self.assertEqual(decide("verdict: clean\n(p3) blank line"), "REPORT")
+
     def test_an_empty_findings_list_does_not_override_clean(self):
         for body in ("## Review\n\n## Findings\nNone.\n\nverdict: clean", "Findings: none\nverdict: clean"):
             with self.subTest(body=body):
