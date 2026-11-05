@@ -162,9 +162,13 @@ class Timers:
         if not isinstance(timers, list) or any(not isinstance(t, dict) or "id" not in t for t in timers):
             raise TimersCorrupt(f"{self.path}: expected an array of timer objects")
         for t in timers:
-            for field in ("id", "state", "row", "due"):
+            for field in ("id", "state", "row", "due", "target", "name", "prompt"):
                 if not isinstance(t.get(field), str) or not t[field].strip():
                     raise TimersCorrupt(f"{self.path}: timer field {field!r} is missing or has the wrong type")
+            if not isinstance(t.get("attempts"), int) or t["attempts"] < 0:
+                raise TimersCorrupt(f"{self.path}: timer {t['id']} has invalid attempt count")
+            if t["state"] not in {"armed", "sending", "delivered", "cancelled", "failed"}:
+                raise TimersCorrupt(f"{self.path}: timer {t['id']} has unknown state {t['state']!r}")
             try:
                 if datetime.fromisoformat(t["due"]).tzinfo is None:
                     raise ValueError('due date must carry a time zone')

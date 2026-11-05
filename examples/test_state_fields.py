@@ -68,7 +68,7 @@ class TimerSchemaTests(TempDir):
         path.write_text(json.dumps([{"id": "t-1", "row": "R-001", "state": "armed", "due": "yesterday"}]))
         record = tm.Timers(path)
         log = record.tick(lambda target, text: self.fail("invalid timers must not deliver"), {"R-001"}, now=T0)
-        self.assertTrue(any("invalid timestamp" in message for message in log))
+        self.assertTrue(any("invalid timestamp" in message or "missing or has the wrong type" in message for message in log))
 
     def test_naive_due_date_and_first_attempt_rejected(self):
         for field in ["due", "first_attempt_at"]:
@@ -90,3 +90,26 @@ class ClaimSchemaTests(TempDir):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TimerPayloadTests(unittest.TestCase):
+    def setUp(self):
+        self.root = pathlib.Path(tempfile.mkdtemp())
+
+    def test_corrupt_payload_is_not_a_failed_send(self):
+        for field in ["attempts", "name", "target", "prompt"]:
+            rec = {"id":"t-bad", "row":"R-1", "state":"armed", "due":T0.isoformat(),
+                   "name":"check", "target":"coordinator", "prompt":"check it", "attempts":0}
+            rec.pop(field)
+            path = self.root/"timers.json"; path.write_text(json.dumps([rec]))
+            with self.assertRaises(tm.TimersCorrupt):
+                tm.Timers(path).load()
+
+    def test_state_and_counter_must_mean_something(self):
+        path = self.root/"timers.json"
+        for field, value in [("attempts", -1), ("state","suspended")]:
+            rec = {"id":"t-bad", "row":"R-1", "state":"armed", "due":T0.isoformat(),
+                   "name":"check", "target":"coordinator", "prompt":"check it", "attempts":0}
+            rec[field]=value
+            path.write_text(json.dumps([rec]))
+            with self.assertRaises(tm.TimersCorrupt):
+                tm.Timers(path).load()
