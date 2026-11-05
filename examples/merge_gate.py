@@ -19,6 +19,16 @@ VERDICT_LINE = re.compile(r"(?m)^\s*verdict:\s*(clean|findings)\s*$")
 PENDING = {"queued", "in_progress", "pending", "waiting", "requested"}
 # Row holds are the owner's words: an uppercase token or a fixed phrase, not any prose containing "held".
 ROW_HOLD = re.compile(r"\bHOLD\b|\bHELD\b|(?i:\bon hold\b|\bdo not merge\b|\bdon'?t merge\b)")
+MD_ESCAPE = re.compile(r"\\([\\`*_{}\[\]()#+.,!_>~|:-])")
+
+
+def rendered_markdown(text: str) -> str:
+    """Match the words an owner wrote, even inline backslash escapes, emphasis or inline code delimiters."""
+    text = MD_ESCAPE.sub(r"\1", text)
+    # leaving backticks in extraction can join rendered words; discard purely structural markers anyway
+    return re.sub(r"[\`*_~]", "", text)
+
+
 PR_HOLD = re.compile(r"(?i)\bdraft:|\bdraft until\b|\bmerge only after\b|\bdo not merge\b|\bdon'?t merge\b|\bon hold\b|\bwip\b")
 
 
@@ -48,7 +58,7 @@ class PR:
 class Policy:
     deploys_on_merge: frozenset[str]
     clean_phrases: tuple[str, ...] = ("no major issues", "looks good to merge")
-    finding_phrases: tuple[str, ...] = ("issue", "finding", "suggest", "bug", "p0", "p1", "p2")
+    finding_phrases: tuple[str, ...] = ("issue", "finding", "suggest", "bug", "p0", "p1", "p2", "p3", "p4")
     # Checks each repo must report on the head SHA. A listed check that has not reported means WAIT, until
     # check_wait after the last push, then REPORT (a renamed or path-filtered job must not stall the repo quietly).
     # A listed check that was skipped is not green. Unlisted checks may be skipped (path filters).
@@ -75,7 +85,7 @@ def _outside_fences(body: str) -> list[str]:
             if fence is None:
                 fence, fence_size = here[0], len(here)
                 continue
-            if fence == here[0] and len(here) >= fence_size:
+            if fence == here[0] and len(here) >= fence_size and not line.strip()[len(here):].strip():
                 fence, fence_size = None, 0
                 continue
         if fence is None:
@@ -90,12 +100,16 @@ def _verdict_lines(body: str) -> list[str]:
     bare search would treat an illustrating code block as the verdict. Fenced regions are not instructions to
     the gate.
     """
-    return [m.group(1) for line in _outside_fences(body) if (m := VERDICT_LINE.match(line))]
+    return [m.group(1) for line in _outside_fences(body)
+            if not re.match(r"(?: {4,}|\t)\S", line) and (m := VERDICT_LINE.match(line))]
 
 
 def review_verdict(pr: PR, policy: Policy) -> str | None:
     """'clean', 'findings', 'unparsed', or None when no receipt names the head SHA."""
-    receipts = [r for r in pr.reviews if r.sha == pr.head_sha]
+    receipts = [r for r in pr.reviews if r.sha == pr.head_sha or
+                                 (len(r.sha) >= 7 and pr.head_sha.lower().startswith(r.sha.lower()))]
+    # A bot's short commit id is read as the actual head if that is what it names, never the reverse. A normal
+    # host-side resolution should confirm the prefix on the current head; older/different-commit reviews fail below.
     if not receipts:
         return None
     body = receipts[-1].body.lower()
@@ -109,12 +123,19 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
     residue = re.sub(r"\bno\s+(?:major\s+)?(?:issues?|findings?|bugs?)\b", " ", body)
     for phrase in policy.clean_phrases:
         residue = residue.replace(phrase, " ")
-    # Findings anywhere in the receipt beat a clean verdict token: the token is a summary, the list is the
-    # evidence that something is left.
-    if any(p in residue for p in policy.finding_phrases):
+    # A reviewer with an explicit verdict followed by documented findings stops if findings survive the clean
+    # phrase boilerplate. A heading followed by None is explicitly empty, and a `No issues found.` sentence is not
+    # a real finding. Empty reports and instructions in fenced code are handled by that doc elsewhere.
+    residue = re.sub(r"(?i)\bfindings?\s*[:\n-]\s*(?:none|nothing)\b", " ", residue)
+    residue = re.sub(r"(?im)^.*\bif\b.*\b(?:issues?|findings?|suggest\w*|bugs?)\b.*$", "", residue)
+    priority = re.search(r"(?i)(?<![\w-])p\d\b", residue)
+    bullet = re.search(r"(?im)^\s*(?:[-*+]|\d+\.)\s+\S", residue)
+    if priority or (bullet and any(p in residue for p in policy.finding_phrases)):
         return "findings"
     if tokens:
         return tokens[-1]
+    if any(p in residue for p in policy.finding_phrases):
+        return "findings"
     return "clean" if clean else "unparsed"
 
 
@@ -136,7 +157,7 @@ def decide(pr: PR, row_text: str, policy: Policy, now: datetime | None = None) -
     now = now or datetime.now(timezone.utc)
     if ROW_HOLD.search(row_text or ""):
         return Decision("REPORT", "row is on hold")
-    if PR_HOLD.search(f"{pr.title}\n{pr.body}"):
+    if PR_HOLD.search(rendered_markdown(f"{pr.title}\n{pr.body}")):
         return Decision("REPORT", "PR title or body carries a hold marker")
     if pr.is_draft and not policy.merge_drafts:
         return Decision("REPORT", "PR is a draft")
