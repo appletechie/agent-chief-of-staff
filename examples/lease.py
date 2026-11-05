@@ -18,6 +18,12 @@ re-read the lease, see it is no longer primary, and act as a companion.
           cannot move between a writer's check and its write: a take waits for writes in flight, and every
           write after it is refused. Writers do not block each other.
 
+A lease file that does not parse, or parses with a bad field (no primary, a renewed_at or since that is not an ISO
+8601 time with a time zone, a ttl_s or epoch that is not a positive whole number), raises LeaseError from every
+read: state, holder, epoch, fenced, renew and take. Nothing repairs it automatically. A scheduled job (the timer
+tick, the merge gate, intake) calls primary_gate() first: a LeaseError there reads as "not primary here", one log
+line, and the job skips. A lease written before epochs existed (no epoch field) is still valid, epoch 0.
+
 Lock order: the lease lock before a store lock. init, renew and take never take a store lock, so a writer that
 waits for the lease lock while holding its store lock (Timers.tick, after a send) cannot deadlock. Inside fenced(),
 the same thread cannot init, renew or take (that would be a lock upgrade); it gets a LeaseError instead of a hang.
@@ -42,6 +48,46 @@ _local = threading.local()
 
 class LeaseError(RuntimeError):
     pass
+
+
+def aware(value) -> datetime | None:
+    """The datetime of an ISO 8601 string that carries a time zone, else None. A naive time is ambiguous: invalid."""
+    if not isinstance(value, str):
+        return None
+    try:
+        when = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.utcoffset() is not None else None
+
+
+def clock(now: datetime | None) -> datetime:
+    """now, or the current UTC time. A naive clock would write a naive time that every later read rejects: refuse it."""
+    if now is None:
+        return datetime.now(timezone.utc)
+    if not isinstance(now, datetime) or now.utcoffset() is None:
+        raise ValueError("lease writes need an aware time (datetime.now(timezone.utc), not datetime.now())")
+    return now
+
+
+def whole(value, minimum: int = 1) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+
+
+def lease_problem(lease: dict) -> str | None:
+    """Why a parsed lease can't be trusted, or None. epoch, host and since are optional (older leases lack them)."""
+    if not isinstance(lease.get("primary"), str) or not lease["primary"].strip():
+        return "'primary' is missing or not a string"
+    if "host" in lease and not isinstance(lease["host"], str):
+        return f"'host' is {type(lease['host']).__name__}, not a string"
+    if not whole(lease.get("ttl_s")):
+        return f"'ttl_s' {str(lease.get('ttl_s'))[:40]!r} is not a whole number of seconds > 0"
+    if "epoch" in lease and not whole(lease["epoch"]):
+        return f"'epoch' {str(lease['epoch'])[:40]!r} is not a whole number >= 1"
+    for name in ("renewed_at", "since"):
+        if (name == "renewed_at" or name in lease) and aware(lease.get(name)) is None:
+            return f"{name!r} {str(lease.get(name))[:40]!r} is not an ISO 8601 time with a time zone"
+    return None
 
 
 @contextmanager
@@ -98,6 +144,9 @@ class Lease:
             raise LeaseError(f"state file {self.path} is corrupt: {error.lineno}:{error.colno} {error.msg}; recover it before running the lease") from error
         if not isinstance(lease, dict):
             raise LeaseError(f"state file {self.path} is not an object (got {type(lease).__name__})")
+        problem = lease_problem(lease)
+        if problem:
+            raise LeaseError(f"state file {self.path}: {problem}; repair it by hand (keep the epoch) before running the lease")
         return lease
 
     def _write(self, data: dict) -> dict:
@@ -109,11 +158,11 @@ class Lease:
         return data
 
     def state(self, now: datetime | None = None) -> str:
-        now = now or datetime.now(timezone.utc)
+        now = clock(now)
         lease = self.read()
         if not lease:
             return "none"
-        renewed = datetime.fromisoformat(lease["renewed_at"])
+        renewed = aware(lease["renewed_at"])
         return "held" if now - renewed <= timedelta(seconds=lease["ttl_s"]) else "expired"
 
     def holder(self) -> str | None:
@@ -125,7 +174,7 @@ class Lease:
 
     def epoch(self) -> int:
         lease = self.read()
-        return int(lease.get("epoch", 0)) if lease else 0
+        return lease.get("epoch", 0) if lease else 0
 
     @contextmanager
     def fenced(self, timeout: float = LOCK_TIMEOUT):
@@ -134,7 +183,7 @@ class Lease:
             yield self.epoch()
 
     def init(self, session_id: str, host: str, now: datetime | None = None) -> dict:
-        now = now or datetime.now(timezone.utc)
+        now = clock(now)
         with file_lock(self.lock):
             if self.read():
                 raise LeaseError(f"lease exists (primary {self.holder()}); use take()")
@@ -146,14 +195,14 @@ class Lease:
             lease = self.read()
             if not lease or lease["primary"] != session_id:
                 raise LeaseError(f"{session_id} does not hold the lease")
-            lease["renewed_at"] = (now or datetime.now(timezone.utc)).isoformat()
+            lease["renewed_at"] = clock(now).isoformat()
             return self._write(lease)
 
     def take(self, session_id: str, host: str, reason: str, now: datetime | None = None,
              force: bool = False) -> dict:
         if not reason.strip():
             raise LeaseError("a takeover needs a reason")
-        now = now or datetime.now(timezone.utc)
+        now = clock(now)
         with file_lock(self.lock):
             state = self.state(now)
             if state == "held" and not force:
@@ -166,6 +215,16 @@ class Lease:
                                 "epoch": int(old.get("epoch", 0)) + 1,
                                 "renewed_at": now.isoformat(), "ttl_s": int(TTL.total_seconds()),
                                 "reason": reason, "previous": previous})
+
+def primary_gate(lease: Lease, job: str, log=print) -> int | None:
+    """For a scheduled job: the epoch to pass as expect_epoch, or None to skip this run. A broken lease file is
+    "not primary here": one log line, and the job does nothing (it never crashes, and never acts unfenced)."""
+    try:
+        return lease.epoch()
+    except LeaseError as error:
+        log(f"{job}: not primary here; skipped ({error})")
+        return None
+
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as root:

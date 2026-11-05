@@ -60,7 +60,7 @@ Before creating anything, refuse if any of these is true:
 | An open PR names the ticket key, **by anyone** | VCS search across every org you work in, title and body | A teammate or another agent is already on it. Searching only your own PRs misses exactly the case that hurts |
 | The ticket is assigned to someone other than the owner or the coordinator | Issue tracker | Someone else owns it |
 | A live worker already carries the row or the key | Agent labels on every host | Two workers, one job |
-| Another session holds a live claim on the row or key | `claims.json` (with a TTL), written under a lock; the claim itself refuses a name another session holds, so two sessions that pass the guard at the same moment cannot both claim | Two coordinator sessions dispatching at once |
+| Another session holds a live claim on the row or key | `claims.json` (with a TTL), written under a lock; the claim itself refuses a name another session holds, so two sessions that pass the guard at the same moment cannot both claim. A claim with a bad field (no session or worker, an `at` without a time zone) can't be aged out, so it refuses that name until a person repairs it | Two coordinator sessions dispatching at once |
 | A dispatch for the same key happened recently from another session | `dispatch.json` | Belt and braces for claims that expired |
 
 Rules:

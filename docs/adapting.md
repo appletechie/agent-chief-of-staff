@@ -58,6 +58,7 @@ The scripts are small and deterministic; test them like any other code.
 - Ledger: concurrent writers do not lose each other's edits; ids are never reused across a closed archive; the checker catches each malformed case.
 - Wake gate: an unreadable source reports CHANGED; max-quiet forces CHANGED; a companion cannot save the shared snapshot.
 - Timers: a crash between `sending` and `delivered` never resends; a timer on a closed row is cancelled; a bad due time defaults rather than failing.
+- Every state file that gates behaviour, with valid JSON and a bad field (a naive or unparseable time, a wrong type, a missing id): the wake gate reads CHANGED, the tick skips that record and ticks the rest, the guard refuses that name, the lease raises its named error.
 - Dispatch guard: replay the incident that motivated it (an open PR by a teammate) and a negative case; a failed VCS search surfaces as a warning.
 - Merge gate: each row of the decision table, plus "review output in an unknown format".
 

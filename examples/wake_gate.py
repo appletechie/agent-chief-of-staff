@@ -12,7 +12,10 @@ Rules this sketch implements:
     the save also needs the caller's current epoch and refuses a stale one, and the check and the save happen
     inside the fence, so a takeover cannot land between them (see lease.py). expect_epoch without a fence is an
     error: the caller believes the save is fenced and it is not;
-  - parts listed in `new_only` (e.g. health findings) change only when a new item appears.
+  - parts listed in `new_only` (e.g. health findings) change only when a new item appears;
+  - a snapshot that parses but has a bad field (not an object, parts that are not objects, a last_changed_at that
+    is not an ISO 8601 time with a time zone) counts as CHANGED, never as quiet; the bad field is dropped, so this
+    pass saves a clean snapshot.
 """
 from __future__ import annotations
 
@@ -37,6 +40,50 @@ def digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:12]
 
 
+def aware(value) -> datetime | None:
+    """The datetime of an ISO 8601 string that carries a time zone, else None. A naive time is ambiguous: invalid."""
+    if not isinstance(value, str):
+        return None
+    try:
+        when = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.utcoffset() is not None else None
+
+
+def clock(now: datetime | None) -> datetime:
+    """now, or the current UTC time. A naive clock would write a naive time that every later read rejects: refuse it."""
+    if now is None:
+        return datetime.now(timezone.utc)
+    if not isinstance(now, datetime) or now.utcoffset() is None:
+        raise ValueError("the wake gate and its snapshot need an aware time (datetime.now(timezone.utc), not datetime.now())")
+    return now
+
+
+def check_snapshot(previous) -> tuple[dict, list[str]]:
+    """(snapshot, problems): drop each field evaluate() can't trust and say why. Any problem means CHANGED."""
+    if previous is None:
+        return {"parts": {}}, []
+    if not isinstance(previous, dict):
+        return {"parts": {}}, [f"previous snapshot is {type(previous).__name__}, not an object; forcing a pass"]
+    previous, problems = dict(previous), []
+    parts = previous.get("parts", {})
+    if not isinstance(parts, dict):
+        problems.append(f"previous snapshot parts is {type(parts).__name__}, not an object; forcing a pass")
+        parts = {}
+    bad = sorted(str(name) for name, items in parts.items() if not isinstance(items, dict))
+    if bad:
+        problems.append(f"previous snapshot part(s) {', '.join(bad[:8])} not an object; forcing a pass")
+        parts = {name: items for name, items in parts.items() if isinstance(items, dict)}
+    previous["parts"] = parts
+    stamp = previous.get("last_changed_at")
+    if stamp is not None and aware(stamp) is None:
+        problems.append(f"previous snapshot last_changed_at {str(stamp)[:40]!r} is not an ISO 8601 time with a time zone; "
+                        "forcing a pass")
+        del previous["last_changed_at"]
+    return previous, problems
+
+
 @dataclass
 class Result:
     changed: bool
@@ -49,7 +96,10 @@ class Result:
 
 def evaluate(collectors: dict[str, Collector], previous: dict, now: datetime,
              max_quiet: timedelta = timedelta(hours=4), new_only: frozenset = frozenset()) -> Result:
-    old_parts = previous.get("parts", {})
+    now = clock(now)
+    first = previous is None or previous == {}
+    previous, problems = check_snapshot(previous)
+    old_parts = previous["parts"]
     parts, lines = {}, []
     for name, collect in collectors.items():
         try:
@@ -72,13 +122,14 @@ def evaluate(collectors: dict[str, Collector], previous: dict, now: datetime,
     lines = lines or []
     if "__unreadable__" in previous:
         lines.append(f"previous snapshot unreadable: {previous['__unreadable__']}")
+    lines += problems
     last_pass = previous.get("last_changed_at")
-    if last_pass and datetime.fromisoformat(last_pass) > now:
+    if last_pass and aware(last_pass) > now:
         lines.append(f"last pass {last_pass} is in the future; forcing a pass")
         last_pass = now.isoformat()  # clamp: never save a future time
-    elif not lines and last_pass and now - datetime.fromisoformat(last_pass) > max_quiet:
+    elif not lines and last_pass and now - aware(last_pass) > max_quiet:
         lines.append(f"quiet for more than {max_quiet}; forcing a pass")
-    if not previous:
+    if first:
         lines.append("no previous snapshot")
     changed = bool(lines)
     snapshot = {
@@ -94,7 +145,7 @@ def run(collectors: dict[str, Collector], state_path: Path, persist: bool, now: 
         **kwargs) -> Result:
     if fence is None and expect_epoch is not None:
         raise ValueError("expect_epoch passed but no fence is configured; the save would not be fenced")
-    now = now or datetime.now(timezone.utc)
+    now = clock(now)
     state_path = Path(state_path)
     try:
         previous = json.loads(state_path.read_text()) if state_path.exists() else {}
