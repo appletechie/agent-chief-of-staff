@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Duplicate-dispatch guard: refuse to start a worker when the work is already under way.
+
+Every external lookup is injected, so the guard is testable offline and works with any VCS host,
+issue tracker or agent runner. A lookup that fails becomes a warning, never a silent pass.
+"""
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Callable, Iterable
+
+CLAIM_TTL = timedelta(hours=6)
+
+
+@dataclass
+class Sources:
+    open_prs_naming: Callable[[str], Iterable[dict]]   # key -> [{"repo", "number", "author"}] across all orgs, any author
+    assignee: Callable[[str], str | None]              # key -> assignee login or None
+    live_workers: Callable[[], Iterable[dict]]         # -> [{"id", "row", "key", "host"}] on every host
+    allowed_assignees: frozenset = frozenset({"owner", "coordinator"})
+
+
+@dataclass
+class Verdict:
+    refusals: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    override: str | None = None
+
+    @property
+    def allowed(self) -> bool:
+        return not self.refusals or bool(self.override)
+
+
+class Claims:
+    """claims.json: {name: {"session", "worker", "at"}} where name is a row id or an issue key."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def load(self) -> dict:
+        return json.loads(self.path.read_text()) if self.path.exists() else {}
+
+    def live(self, now: datetime) -> dict:
+        return {k: v for k, v in self.load().items() if now - datetime.fromisoformat(v["at"]) < CLAIM_TTL}
+
+    def claim(self, names: Iterable[str], session: str, worker: str, now: datetime) -> None:
+        data = self.live(now)
+        for name in names:
+            data[name] = {"session": session, "worker": worker, "at": now.isoformat()}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self.path.parent)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, self.path)
+
+
+def guard(key: str | None, row: str, session: str, sources: Sources, claims: Claims,
+          now: datetime | None = None, add_worker: bool = False, allow_duplicate: str | None = None) -> Verdict:
+    now = now or datetime.now(timezone.utc)
+    v = Verdict()
+    if allow_duplicate is not None and not allow_duplicate.strip():
+        raise ValueError("--allow-duplicate needs a reason")
+
+    if key:
+        try:
+            for pr in sources.open_prs_naming(key):
+                v.refusals.append(f"open PR {pr['repo']}#{pr['number']} by {pr['author']} names {key}")
+        except Exception as error:
+            v.warnings.append(f"PR search failed ({type(error).__name__}); duplicate PRs not ruled out")
+        try:
+            who = sources.assignee(key)
+            if who and who not in sources.allowed_assignees:
+                v.refusals.append(f"{key} is assigned to {who}")
+        except Exception as error:
+            v.warnings.append(f"assignee lookup failed ({type(error).__name__})")
+
+    try:
+        for w in sources.live_workers():
+            if w.get("row") == row or (key and w.get("key") == key):
+                if add_worker and w.get("row") == row:
+                    v.warnings.append(f"adding a second worker beside {w['id']} on {row}")
+                else:
+                    v.refusals.append(f"live worker {w['id']} on {w.get('host', '?')} carries {w.get('row') or w.get('key')}")
+    except Exception as error:
+        v.warnings.append(f"worker listing failed ({type(error).__name__})")
+
+    for name in filter(None, (row, key)):
+        held = claims.live(now).get(name)
+        if held and held["session"] != session:
+            v.refusals.append(f"{name} claimed by session {held['session']} (worker {held['worker']}) at {held['at']}")
+
+    if v.refusals and allow_duplicate:
+        v.override = allow_duplicate
+    return v
+
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory() as root:
+        claims = Claims(Path(root) / "claims.json")
+        teammate_pr = Sources(
+            open_prs_naming=lambda key: [{"repo": "org/app", "number": 139, "author": "teammate"}],
+            assignee=lambda key: "owner",
+            live_workers=lambda: [],
+        )
+        v = guard("ISSUE-308", "R-020", "coordinator-a1", teammate_pr, claims)
+        print("allowed:", v.allowed, "refusals:", v.refusals)
+        clear = Sources(open_prs_naming=lambda key: [], assignee=lambda key: None, live_workers=lambda: [])
+        v = guard("ISSUE-309", "R-021", "coordinator-a1", clear, claims)
+        print("allowed:", v.allowed, "refusals:", v.refusals)
