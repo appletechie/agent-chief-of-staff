@@ -178,9 +178,14 @@ class Timers:
         with self._fenced(expect_epoch), file_lock(self.lock):
             timers = self.load()
             taken = {t["id"] for t in timers}
-            timer_id = "t-" + secrets.token_hex(3)
-            while timer_id in taken:
+            # token_hex collision is rare; a pasted, broken or exhausted RNG must not wedge the store with a
+            # never-ending redraw while it holds lock.
+            for _ in range(10):
                 timer_id = "t-" + secrets.token_hex(3)
+                if timer_id not in taken:
+                    break
+            else:
+                raise RuntimeError("could not draw a free timer id after 10 attempts; check the RNG")
             timer = {"id": timer_id, "row": row, "name": name, "due": when.isoformat(),
                      "target": target, "owner": owner, "prompt": prompt, "state": "armed",
                      "attempts": 0, "source": source, "note": note}
