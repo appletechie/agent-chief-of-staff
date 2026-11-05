@@ -427,6 +427,17 @@ def pr_refs(text: str) -> list[tuple[str, int]]:
     return out
 
 
+def compose_close_policies(*policies: Callable[[dict, Proof], str | None] | None) -> Callable[[dict, Proof], str | None]:
+    """One can_close policy from several (for example merge SHA, then a clean review): the first refusal wins."""
+    def can_close(row: dict, proof: Proof) -> str | None:
+        for policy in policies:
+            reason = policy(row, proof) if policy is not None else None
+            if reason:
+                return reason
+        return None
+    return can_close
+
+
 def pr_merge_policy(lookup: Callable[[str, int], str | None]) -> Callable[[dict, Proof], str | None]:
     """A can_close policy: a row whose cells name a PR closes as `merged` only with that PR's merge SHA.
 

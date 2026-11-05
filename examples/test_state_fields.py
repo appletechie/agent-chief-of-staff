@@ -226,5 +226,22 @@ class ClaimFields(TempDir):
         self.assertTrue(dg.guard(None, "R-001", "me", self.SOURCES, claims, now=T0 + dg.CLAIM_TTL).allowed)
 
 
+class NaiveClock(unittest.TestCase):
+    """karutoil's #18 follow-up: a naive clock is refused at the timer boundary, before it can write a naive due."""
+
+    def test_add_tick_and_wait_refuse_a_naive_clock(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = pathlib.Path(root) / "timers.json"
+            with self.assertRaises(ValueError):
+                tm.Timers(path).add("R-001", "+5m", "x", "p", now=datetime(2026, 1, 16, 14, 0))
+            self.assertFalse(path.exists())
+            store = tm.Timers(path)
+            store.add("R-001", "+1m", "x", "p", now=T0)
+            with self.assertRaises(ValueError):
+                store.tick(lambda target, text: self.fail("sent on a naive clock"), {"R-001"}, now=datetime(2026, 1, 16, 15, 0))
+            with self.assertRaises(ValueError):
+                tm.parse_wait("WAIT ci org/app#88 +45m", datetime(2026, 1, 16, 14, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

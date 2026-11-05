@@ -103,6 +103,20 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
     return "clean" if clean else "unparsed"
 
 
+def review_problem(pr: PR, policy: Policy) -> str | None:
+    """Why the review on the head SHA is not clean, or None. The one definition: decide() and the close use it."""
+    verdict = review_verdict(pr, policy)
+    if verdict is None:
+        return f"no review receipt for {pr.head_sha[:7]}"
+    if verdict == "findings":
+        return "review on head has findings"
+    if verdict == "unparsed":
+        return "review output not recognized; treat as not clean"
+    if pr.unresolved_threads:
+        return f"{pr.unresolved_threads} unresolved review threads"
+    return None
+
+
 def decide(pr: PR, row_text: str, policy: Policy, now: datetime | None = None) -> Decision:
     now = now or datetime.now(timezone.utc)
     if ROW_HOLD.search(row_text or ""):
@@ -130,21 +144,45 @@ def decide(pr: PR, row_text: str, policy: Policy, now: datetime | None = None) -
                  if s not in GREEN or (n in required and s not in REQUIRED_GREEN))
     if red:
         return Decision("REPORT", "checks not green on head: " + ", ".join(red))
-    verdict = review_verdict(pr, policy)
-    if verdict is None:
+    if review_verdict(pr, policy) is None:
         quiet = now - pr.last_push_at
         if quiet >= policy.review_wait and pr.head_sha not in pr.review_requested_for:
             return Decision("REQUEST_REVIEW", f"no review receipt for {pr.head_sha[:7]} after {quiet}")
         return Decision("WAIT", f"waiting for review of {pr.head_sha[:7]}")
-    if verdict == "findings":
-        return Decision("REPORT", "review on head has findings")
-    if verdict == "unparsed":
-        return Decision("REPORT", "review output not recognized; treat as not clean")
-    if pr.unresolved_threads:
-        return Decision("REPORT", f"{pr.unresolved_threads} unresolved review threads")
+    problem = review_problem(pr, policy)
+    if problem:
+        return Decision("REPORT", problem)
     if pr.repo in policy.deploys_on_merge:
         return Decision("REPORT", "ready, but this repo deploys on merge: coordinator merges and live-checks")
     return Decision("MERGE", f"green on {pr.head_sha[:7]}")
+
+
+def pr_review_policy(lookup, policy: Policy | None = None):
+    """A can_close policy (#19): a row that names a PR closes as `merged` only when the review on that PR's head SHA
+    is clean, by review_problem(), the same definition decide() merges on.
+
+    lookup(repo, number) returns the PR (its state after the merge); None or a lookup error refuses the close. Only
+    the review is checked here, not decide() as a whole: after a merge, mergeability, hold markers and drafts no
+    longer mean "not done". Compose with ledger_store.pr_merge_policy to require the merge SHA too.
+    """
+    policy = policy or Policy(frozenset())
+
+    def can_close(row, proof):
+        from ledger_store import FIELDS, pr_refs
+        if proof.kind != "merged":
+            return None
+        for repo, number in pr_refs(" ".join(str(row.get(k, "")) for k in FIELDS)):
+            try:
+                pr = lookup(repo, number)
+            except Exception as error:  # a broken lookup must not read as "allowed"
+                return f"cannot read {repo}#{number} ({error})"
+            if pr is None:
+                return f"cannot rule out findings on {repo}#{number}: no PR state was returned"
+            problem = review_problem(pr, policy)
+            if problem:
+                return f"{repo}#{number} review on head {pr.head_sha[:7]} is not clean: {problem}"
+        return None
+    return can_close
 
 
 if __name__ == "__main__":

@@ -100,6 +100,15 @@ def file_lock(path: Path, timeout: float = LOCK_TIMEOUT):
         os.close(fd)
 
 
+def clock(now: datetime | None) -> datetime:
+    """now, or the current UTC time. A naive clock would write naive due times that every later tick rejects: refuse it."""
+    if now is None:
+        return datetime.now(timezone.utc)
+    if not isinstance(now, datetime) or now.utcoffset() is None:
+        raise ValueError("timers need an aware time (datetime.now(timezone.utc), not datetime.now())")
+    return now
+
+
 def parse_due(text: str | None, now: datetime) -> tuple[datetime, str | None]:
     """Accept +Nm / +Nh, HH:MMZ (next occurrence) or ISO. Never raise: fall back to now + 60 min with a note."""
     text = (text or "").strip()
@@ -120,6 +129,7 @@ def parse_due(text: str | None, now: datetime) -> tuple[datetime, str | None]:
 
 def parse_wait(line: str, now: datetime) -> dict | None:
     """Parse `WAIT <kind> <ref> <check-by>` leniently. Only WAIT is required."""
+    now = clock(now)
     m = WAIT_LINE.match(line or "")
     if not m:
         return None
@@ -216,7 +226,7 @@ class Timers:
     def add(self, row: str, due: str, name: str, prompt: str, target: str = "coordinator",
             owner: str = "coordinator", source: str = "cli", now: datetime | None = None,
             expect_epoch: int | None = None) -> dict:
-        now = now or datetime.now(timezone.utc)
+        now = clock(now)
         when, note = parse_due(due, now)
         with self._fenced(expect_epoch), file_lock(self.lock):
             timers = self.load()
@@ -237,7 +247,7 @@ class Timers:
 
     def from_wait(self, line: str, row: str, owner: str, now: datetime | None = None,
                   expect_epoch: int | None = None) -> dict | None:
-        now = now or datetime.now(timezone.utc)
+        now = clock(now)
         wait = parse_wait(line, now)
         if wait is None:
             return None
@@ -249,9 +259,10 @@ class Timers:
     def tick(self, send: Callable[[str, str], str], open_rows: set[str], now: datetime | None = None,
              expect_epoch: int | None = None) -> list[str]:
         """Deliver due timers. Persists the `sending` mark before each send. Returns one log line per action."""
+        now = clock(now)
         try:
             with file_lock(self.lock, timeout=0):
-                return self._tick(send, open_rows, now or datetime.now(timezone.utc), expect_epoch)
+                return self._tick(send, open_rows, now, expect_epoch)
         except LockTimeout:
             return ["another tick is running; delivered nothing"]
         except TimersCorrupt as error:
