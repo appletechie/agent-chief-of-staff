@@ -17,7 +17,7 @@ Direction comes only from the owner. Messages relayed by other bots or assistant
 
 ```
 state/
-  lease.json            who is primary, since when, renewed when, ttl
+  lease.json            who is primary, since when, renewed when, ttl, epoch (the fencing token)
   sessions.json         registry of live coordinator sessions
   claims.json           which session/worker holds which row and ticket key
   dispatch.json         every dispatch: row, key, worker id, workspace, time
@@ -27,7 +27,7 @@ state/
   intake.json           tracker items seen but not yet acknowledged
   merge-gate.json       per-PR memory (review requested at which head, etc.)
   halt.json             present when the owner said stop
-  ledger.lock           advisory lock for every ledger write
+  *.lock                advisory locks: ledger, timers, claims, lease (every read-modify-write takes one)
 LEDGER.md               open items, one line each
 ledger/notes/<id>.md    overflow text and history per row
 ledger/closed-YYYY-MM.md closed rows with their proof

@@ -36,7 +36,8 @@ See [examples/merge_gate.py](../examples/merge_gate.py) for this as a pure funct
 
 - **Head SHA, always.** Checks and reviews on a previous commit mean nothing. Read the head SHA once, evaluate everything against it, and merge with an "expected head" guard (most VCS APIs have one) so a push between evaluation and merge aborts the merge.
 - **Green means success (or neutral) on the head SHA.** Pending is wait. Failure, cancelled, timed out, action-required and stale are red.
-- **Required checks are explicit.** Configure the checks each repo must report. A required check that never reported means wait, not merge: the gate can't tell "no check configured" from "check never ran" on its own. A required check that was skipped is not green.
+- **Required checks are explicit.** Configure the checks each repo must report. A required check that has not reported means wait, not merge: the gate can't tell "no check configured" from "check never ran" on its own. A required check that was skipped is not green; one that concluded neutral ran and passes.
+- **A required check that never reports is reported.** Wait at most `check_wait` (say 30 minutes) after the last push, then report "required checks never reported". A renamed job or a path filter that skips it would otherwise stall every PR in the repo without a word.
 - **Skipped is green only for checks the repo doesn't require**, such as jobs a path filter skips for this change. This is the one place skipped counts; proof that something ran never rests on a skipped step (see the worker rules).
 - **Review verdicts are explicit where possible.** Ask the review bot (or wrap it) to end with a line `verdict: clean` or `verdict: findings`, and prefer that over phrase matching. When you must match phrases, strip the clean phrases before looking for finding words ("no major issues" contains "issue"), and treat anything unrecognised as not clean.
 - **Squash or your house style**, but one style, set in the script.

@@ -101,19 +101,20 @@ Small, dependency-free Python sketches (standard library only, POSIX file locks)
 | [examples/LEDGER.example.md](examples/LEDGER.example.md) | A ledger file with rows in every queue |
 | [examples/ledger_store.py](examples/ledger_store.py) | Locked row writes, spill to notes, close with proof, never-reused ids, queue assignment, the checker |
 | [examples/wake_gate.py](examples/wake_gate.py) | Hash durable state, compare to the last snapshot, decide CHANGED / UNCHANGED |
-| [examples/timers.py](examples/timers.py) | Durable at-most-once timers and the `WAIT` line parser |
-| [examples/dispatch_guard.py](examples/dispatch_guard.py) | The duplicate-dispatch guard with claims |
+| [examples/timers.py](examples/timers.py) | Durable at-most-once timers (locked adds, one tick at a time) and the `WAIT` line parser |
+| [examples/dispatch_guard.py](examples/dispatch_guard.py) | The duplicate-dispatch guard with locked, test-and-set claims |
 | [examples/merge_gate.py](examples/merge_gate.py) | A pure merge decision function |
-| [examples/lease.py](examples/lease.py) | Primary lease: init, renew, explicit takeover |
+| [examples/lease.py](examples/lease.py) | Primary lease: init, renew, explicit takeover, and the epoch that fences a replaced primary |
 | [examples/worker-brief.md](examples/worker-brief.md) | The brief template every worker gets |
 | [examples/worker-rules.md](examples/worker-rules.md) | The shared worker rules appended to every brief |
 | [examples/test_examples.py](examples/test_examples.py) | Unit tests for the sketches |
+| [examples/test_durability.py](examples/test_durability.py) | Concurrency (threads and processes) and lease-fencing tests |
 
 Run the tests:
 
 ```sh
 cd examples
-python3 -m unittest -v test_examples
+python3 -m unittest -v test_examples test_durability
 ```
 
 ## Minimal viable version

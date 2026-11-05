@@ -3,28 +3,87 @@
 
 A tick (run every minute by the OS scheduler) delivers due timers:
   armed --(due)--> sending --(send ok)--> delivered
-                       \\--(send error)--> armed again (attempts += 1), failed after MAX_ATTEMPTS
+                       \\--(send error)--> armed again (attempts += 1), failed once RETRY_WINDOW has passed
+                                          since the first attempt
   a timer found in `sending` at the start of a tick crashed mid-send: it becomes failed, never resent blind
   a due timer whose ledger row is closed is cancelled with a reason
+
+Every read-modify-write of timers.json happens under one exclusive lock. `add` waits for it (up to LOCK_TIMEOUT,
+then fails loudly); `tick` never waits: a second tick finds the lock held and delivers nothing. The tick holds the
+lock across each send, so `sending` on disk always means a crashed tick, never one still running.
+
+Fencing: build the store with `lease_epoch` (a callable returning the lease's current epoch, e.g. Lease.epoch) and
+every write must pass `expect_epoch`; a stale epoch (the lease was taken since the caller read it) is refused.
 
 `send(target, text)` is injected: in production it queues a message into the coordinator's session,
 which is delivered when the session is next free (never "start a run", which a busy agent may reject).
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import secrets
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
-MAX_ATTEMPTS = 5
+RETRY_WINDOW = timedelta(hours=4)  # retry send errors this long after the first attempt, then fail
+LOCK_TIMEOUT = 20.0
 DEFAULT_DELAY = timedelta(minutes=60)
 WAIT_LINE = re.compile(r"^\s*WAIT\b\s*(?P<kind>\S+)?\s*(?P<ref>\S+)?\s*(?P<check_by>.+)?$")
 KINDS = {"ci", "review", "deploy", "render", "date", "person", "other"}
+
+_local = threading.local()
+
+
+class LockTimeout(TimeoutError):
+    pass
+
+
+class StaleEpoch(RuntimeError):
+    """The lease was taken after the caller read its epoch: this session is no longer the one it thinks it is."""
+
+
+@contextmanager
+def file_lock(path: Path, timeout: float = LOCK_TIMEOUT):
+    """Exclusive advisory lock, re-entrant per thread. Copied from ledger_store.file_lock to keep this file standalone."""
+    path = Path(path).resolve()
+    held = _local.__dict__.setdefault("held", {})
+    if path in held:
+        held[path] += 1
+        try:
+            yield
+        finally:
+            held[path] -= 1
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise LockTimeout(f"{path} held by {Path(path).read_text().strip() or 'unknown'}")
+                time.sleep(0.05)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"pid={os.getpid()}".encode())
+        held[path] = 1
+        try:
+            yield
+        finally:
+            del held[path]
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def parse_due(text: str | None, now: datetime) -> tuple[datetime, str | None]:
@@ -62,8 +121,17 @@ def parse_wait(line: str, now: datetime) -> dict | None:
 
 
 class Timers:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, lease_epoch: Callable[[], int] | None = None):
         self.path = Path(path)
+        self.lock = self.path.with_suffix(".lock")
+        self.lease_epoch = lease_epoch
+
+    def _fence(self, expect_epoch: int | None) -> None:
+        if self.lease_epoch is None:
+            return
+        current = self.lease_epoch()
+        if expect_epoch != current:
+            raise StaleEpoch(f"lease epoch is {current}, caller holds {expect_epoch}; re-read the lease")
 
     def load(self) -> list[dict]:
         return json.loads(self.path.read_text()) if self.path.exists() else []
@@ -76,16 +144,20 @@ class Timers:
         os.replace(tmp, self.path)
 
     def add(self, row: str, due: str, name: str, prompt: str, target: str = "coordinator",
-            owner: str = "coordinator", source: str = "cli", now: datetime | None = None) -> dict:
+            owner: str = "coordinator", source: str = "cli", now: datetime | None = None,
+            expect_epoch: int | None = None) -> dict:
         now = now or datetime.now(timezone.utc)
         when, note = parse_due(due, now)
         timer = {"id": "t-" + secrets.token_hex(3), "row": row, "name": name, "due": when.isoformat(),
                  "target": target, "owner": owner, "prompt": prompt, "state": "armed",
                  "attempts": 0, "source": source, "note": note}
-        self.save(self.load() + [timer])
+        with file_lock(self.lock):
+            self._fence(expect_epoch)
+            self.save(self.load() + [timer])
         return timer
 
-    def from_wait(self, line: str, row: str, owner: str, now: datetime | None = None) -> dict | None:
+    def from_wait(self, line: str, row: str, owner: str, now: datetime | None = None,
+                  expect_epoch: int | None = None) -> dict | None:
         now = now or datetime.now(timezone.utc)
         wait = parse_wait(line, now)
         if wait is None:
@@ -93,11 +165,19 @@ class Timers:
         prompt = (f"{row}: worker {owner} is waiting on {wait['kind']} {wait['ref'] or '(no ref)'}. "
                   "Check it, then resume or close the worker.")
         return self.add(row, wait["due"].isoformat(), f"wait {wait['kind']}", prompt,
-                        owner=owner, source="wait-line", now=now)
+                        owner=owner, source="wait-line", now=now, expect_epoch=expect_epoch)
 
-    def tick(self, send: Callable[[str, str], str], open_rows: set[str], now: datetime | None = None) -> list[str]:
+    def tick(self, send: Callable[[str, str], str], open_rows: set[str], now: datetime | None = None,
+             expect_epoch: int | None = None) -> list[str]:
         """Deliver due timers. Persists the `sending` mark before each send. Returns one log line per action."""
-        now = now or datetime.now(timezone.utc)
+        try:
+            with file_lock(self.lock, timeout=0):
+                return self._tick(send, open_rows, now or datetime.now(timezone.utc), expect_epoch)
+        except LockTimeout:
+            return ["another tick is running; delivered nothing"]
+
+    def _tick(self, send, open_rows: set[str], now: datetime, expect_epoch: int | None) -> list[str]:
+        self._fence(expect_epoch)
         timers, log = self.load(), []
         for t in timers:
             if t["state"] == "sending":
@@ -112,15 +192,18 @@ class Timers:
                 log.append(f"{t['id']} cancelled (row closed)")
                 self.save(timers)
                 continue
+            self._fence(expect_epoch)  # a takeover during a long tick stops it before the next send
             t["state"] = "sending"
+            t.setdefault("first_attempt_at", now.isoformat())
             self.save(timers)
             try:
                 receipt = send(t["target"], f"[timer {t['id']} {t['name']}] {t['prompt']}")
             except Exception as error:
                 t["attempts"] += 1
-                t["state"] = "failed" if t["attempts"] >= MAX_ATTEMPTS else "armed"
+                expired = now - datetime.fromisoformat(t["first_attempt_at"]) >= RETRY_WINDOW
+                t["state"] = "failed" if expired else "armed"
                 t["note"] = f"send error: {type(error).__name__}"
-                log.append(f"{t['id']} send error, attempt {t['attempts']}")
+                log.append(f"{t['id']} send error, attempt {t['attempts']}" + ("; retry window over" if expired else ""))
             else:
                 t["state"], t["delivered_at"], t["receipt"] = "delivered", now.isoformat(), str(receipt)[:200]
                 log.append(f"{t['id']} delivered to {t['target']}")
