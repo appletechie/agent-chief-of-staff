@@ -118,3 +118,7 @@ Nothing generated is hand-edited. If a view is wrong, fix the source or the gene
 ## History lives elsewhere
 
 The ledger is an index, not a journal. Put the story of an item in tracker comments (proof, caveats, what was tried) or in its notes file. A tracker issue moves to done only with its caveats written on the issue.
+
+Where a PR-proof must carry both the merge and the clean review, post a composed policy:
+`can_close=compose_close_policies(pr_merge_policy(lookup), merge_gate.pr_review_policy(pr_lookup))`.
+`pr_review_policy` reuses merge_gate's `decide` on the PR's head SHA, using a lookup that returns `PR` objects.

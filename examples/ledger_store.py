@@ -427,6 +427,23 @@ def pr_refs(text: str) -> list[tuple[str, int]]:
     return out
 
 
+def compose_close_policies(*policies):
+    """Chain row-close constraints so a merge SHA and a clean review can both be required.
+
+    The later policy is only consulted when the earlier one was satisfied, so the first refusal is the reason
+    the coordinator reports.
+    """
+    def close(xrow, xproof):
+        for policy in policies:
+            if policy is None:
+                continue
+            reason = policy(xrow, xproof)
+            if reason:
+                return reason
+        return None
+    return close
+
+
 def pr_merge_policy(lookup: Callable[[str, int], str | None]) -> Callable[[dict, Proof], str | None]:
     """A can_close policy: a row whose cells name a PR closes as `merged` only with that PR's merge SHA.
 

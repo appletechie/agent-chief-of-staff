@@ -147,6 +147,32 @@ def decide(pr: PR, row_text: str, policy: Policy, now: datetime | None = None) -
     return Decision("MERGE", f"green on {pr.head_sha[:7]}")
 
 
+def pr_review_policy(lookup):
+    """Close-side check: the PRs named by the row were really green to merge (not merely merged).
+
+    Push more policy into the gate than the close caller: `lookup(repo, number) -> PR | None` supplies all
+    observable PR state; None when there is no longer a PR or it is unreadable means refuse. The same `decide`
+    rule that stops a merge stops the close.
+
+    Compose with `pr_merge_policy(lookup)` in `ledger_store`, or another can_close callback, when the proof must
+    include the actual merge commit too.
+    """
+    def can_close(row, proof):
+        from ledger_store import pr_refs, FIELDS
+        for repo, number in pr_refs(" ".join(str(row.get(k, "")) for k in FIELDS)):
+            try:
+                pr = lookup(repo, number)
+            except Exception as error:
+                return f"cannot read {repo}#{number} ({error})"
+            if pr is None:
+                return f"cannot rule out findings for {repo}#{number}: no PR state was returned"
+            gate = decide(pr, "", Policy(frozenset()))
+            if gate.action != "MERGE":
+                return f"{repo}#{number} not closable on the head {pr.head_sha[:7]}: {gate.reason}"
+        return None
+    return can_close
+
+
 if __name__ == "__main__":
     t0 = datetime(2026, 1, 16, 14, 0, tzinfo=timezone.utc)
     policy = Policy(deploys_on_merge=frozenset({"org/website"}))
