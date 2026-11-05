@@ -9,8 +9,10 @@ Layout (relative to a root directory):
 
 Standard library only. Uses fcntl, so POSIX; swap file_lock() for another primitive elsewhere.
 
-Fencing: build the Ledger with lease_epoch (a callable returning the lease's current epoch, e.g. Lease.epoch) and
-every write must pass expect_epoch; a stale epoch is refused under the lock (see lease.py).
+Fencing: build the Ledger with fence=lease.fenced (a context manager that blocks takeovers and yields the lease's
+current epoch) and every write must pass expect_epoch; a stale epoch is refused. The fence is taken before the
+ledger lock and held for the whole write, so a takeover cannot land between the check and the write (see lease.py).
+Passing expect_epoch without a fence is an error: the caller believes it is fenced and is not.
 """
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, ContextManager
 
 COLUMNS = ["id", "key", "owner", "next action", "waits on", "due"]
 FIELDS = ["id", "key", "owner", "next", "waits", "due"]
@@ -86,22 +88,28 @@ def file_lock(path: Path, timeout: float = LOCK_TIMEOUT):
 
 
 class Ledger:
-    def __init__(self, root: Path, lease_epoch: Callable[[], int] | None = None,
+    def __init__(self, root: Path, fence: Callable[[], ContextManager[int]] | None = None,
                  require_key: Callable[[dict], bool] | None = None):
         """require_key(row) -> True where your policy needs an issue key, e.g. lambda r: r["owner"].startswith("worker-")."""
         self.root = Path(root)
         self.path = self.root / "LEDGER.md"
         self.notes = self.root / "ledger" / "notes"
         self.lock = self.root / "state" / "ledger.lock"
-        self.lease_epoch = lease_epoch
+        self.fence = fence
         self.require_key = require_key
 
-    def _fence(self, expect_epoch: int | None) -> None:
-        if self.lease_epoch is None:
+    @contextmanager
+    def _fenced(self, expect_epoch: int | None):
+        """Hold the fence (lease lock, shared) for the whole write; refuse a stale or missing epoch."""
+        if self.fence is None:
+            if expect_epoch is not None:
+                raise ValueError("expect_epoch passed but no fence is configured; the write would not be fenced")
+            yield
             return
-        current = self.lease_epoch()
-        if expect_epoch != current:
-            raise StaleEpoch(f"lease epoch is {current}, caller holds {expect_epoch}; re-read the lease")
+        with self.fence() as current:
+            if expect_epoch != current:
+                raise StaleEpoch(f"lease epoch is {current}, caller holds {expect_epoch}; re-read the lease")
+            yield
 
     # ---------- reading ----------
 
@@ -138,8 +146,7 @@ class Ledger:
 
     def write_row(self, row_id: str | None, expect_epoch: int | None = None, **fields) -> dict:
         """Create (row_id=None) or update a row. Long text spills to notes; returns the row written."""
-        with file_lock(self.lock):
-            self._fence(expect_epoch)
+        with self._fenced(expect_epoch), file_lock(self.lock):  # lock order: fence, then store
             lines = self._lines()
             rows = {r["id"]: r for r in self.rows()}
             if row_id is None:
@@ -169,8 +176,7 @@ class Ledger:
         if not proof or not proof.strip():
             raise ValueError("a row closes only with proof")
         now = now or datetime.now(timezone.utc)
-        with file_lock(self.lock):
-            self._fence(expect_epoch)
+        with self._fenced(expect_epoch), file_lock(self.lock):
             lines = self._lines()
             match = [r for r in self.rows() if r["id"] == row_id]
             if not match:
@@ -187,7 +193,10 @@ class Ledger:
             return str(archive)
 
     def _spill(self, row: dict) -> dict:
-        """Over budget: save the full text to the row's note, then cut next action, then waits on, until it fits."""
+        """Over budget: save the full text to the row's note, then cut next action, then waits on, until it fits.
+
+        In waits on, a clause that starts with "then" (a later step, often the owner's) is never cut: the longest
+        other clause is cut from its end, so the first clause still sets the queue and the later step still shows."""
         if row_chars(row) <= ROW_BUDGET:
             return row
         self.notes.mkdir(parents=True, exist_ok=True)
@@ -201,9 +210,7 @@ class Ledger:
             over = row_chars(row) - ROW_BUDGET
             if over <= 0:
                 break
-            keep = max(len(row[k]) - over - len(pointer), 40)
-            if keep < len(row[k]):
-                row[k] = row[k][:keep].rstrip() + pointer
+            row[k] = cut_waits(row[k], over, pointer) if k == "waits" else cut(row[k], over, pointer)
         return row
 
     # ---------- checking ----------
@@ -277,6 +284,21 @@ def clean(value) -> str:
 
 def row_chars(row: dict) -> int:
     return len(table_line([row[k] for k in FIELDS if k != "owner"]))
+
+
+def cut(text: str, over: int, pointer: str) -> str:
+    keep = max(len(text) - over - len(pointer), 40)
+    return text[:keep].rstrip() + pointer if keep < len(text) else text
+
+
+def cut_waits(text: str, over: int, pointer: str) -> str:
+    clauses = text.split(";")
+    cuttable = [i for i, c in enumerate(clauses) if not c.strip().lower().startswith("then")]
+    if not cuttable:
+        return text
+    i = max(cuttable, key=lambda j: len(clauses[j]))
+    clauses[i] = cut(clauses[i], over, pointer)
+    return ";".join(clauses)
 
 
 def atomic_write(path: Path, text: str) -> None:

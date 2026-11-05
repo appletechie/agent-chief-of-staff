@@ -32,11 +32,13 @@ A lease nothing checks is advice. The case it must survive: the primary's laptop
 So every shared write carries the writer's epoch and is refused when it is not the lease's current epoch:
 
 - the ledger (`write_row`, `close_row`), timers (`add`, `tick`) and the wake-gate save each take `expect_epoch`;
-- the store compares it with the lease file under its own lock, so a takeover that lands mid-write is ordered after that write, and every later write from the old epoch is refused;
+- the check and the write happen inside one fence: the writer holds the lease lock *shared* for the whole write (before its own store lock), and takeover, init and renew hold it *exclusive*. A takeover therefore waits for writes already past the check, and every write after it is refused. Writers don't block each other;
+- lock order is lease lock, then store lock. The lease's exclusive holders never take a store lock, so this can't deadlock;
+- the one exception is the timer tick, which releases the fence around each send so a takeover never waits on a slow send. After the send it re-takes the fence and re-checks the epoch before recording the outcome. The bounded window is one send: a takeover during a send can't recall a message already on its way, but the replaced tick records nothing and stops, and the new primary's next tick marks that timer failed ("not resent"), so it's surfaced and never sent twice;
 - the primary gets its epoch from its renewal at the start of each pass; a companion reads it at boot;
 - a refused write means "re-read the lease": the old primary finds it is no longer primary, says so, and continues as a companion.
 
-In the sketches each store accepts `lease_epoch=lease.epoch` (a callable, so the modules stay independent) and, once given one, refuses any write without the current epoch. A single-session setup can leave it unset.
+In the sketches each store accepts `fence=lease.fenced` (a context manager that holds the lease lock shared and yields the current epoch; passed in, so the modules stay independent). Once a store has a fence, it refuses any write without the current epoch. A single-session setup can leave it unset. Passing `expect_epoch` to a store with no fence is an error, not a no-op: the caller believes it is fenced.
 
 ## Primary vs companion
 
