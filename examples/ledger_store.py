@@ -46,6 +46,10 @@ class LockTimeout(RuntimeError):
     pass
 
 
+class CloseRefused(ValueError):
+    """The supplied close policy rejected this row/proof pair (PR not merged, review still open, ...)."""
+
+
 class StaleEpoch(RuntimeError):
     """The lease was taken after the caller read its epoch: re-read the lease before writing again."""
 
@@ -89,7 +93,8 @@ def file_lock(path: Path, timeout: float = LOCK_TIMEOUT):
 
 class Ledger:
     def __init__(self, root: Path, fence: Callable[[], ContextManager[int]] | None = None,
-                 require_key: Callable[[dict], bool] | None = None):
+                 require_key: Callable[[dict], bool] | None = None,
+                 can_close: Callable[[dict, str], str | None] | None = None):
         """require_key(row) -> True where your policy needs an issue key, e.g. lambda r: r["owner"].startswith("worker-")."""
         self.root = Path(root)
         self.path = self.root / "LEDGER.md"
@@ -97,6 +102,7 @@ class Ledger:
         self.lock = self.root / "state" / "ledger.lock"
         self.fence = fence
         self.require_key = require_key
+        self.can_close = can_close
 
     @contextmanager
     def _fenced(self, expect_epoch: int | None):
@@ -182,6 +188,10 @@ class Ledger:
             if not match:
                 raise KeyError(f"{row_id} is not open")
             row = match[0]
+            if self.can_close is not None:
+                reason = self.can_close(row, proof)
+                if reason:
+                    raise CloseRefused(reason)
             archive = self.root / "ledger" / f"closed-{now:%Y-%m}.md"
             archive.parent.mkdir(parents=True, exist_ok=True)
             if not archive.exists():
