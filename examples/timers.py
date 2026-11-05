@@ -12,19 +12,67 @@ which is delivered when the session is next free (never "start a run", which a b
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import secrets
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
 MAX_ATTEMPTS = 5
+LOCK_TIMEOUT = 20.0
+_local = threading.local()  # re-entrancy is per thread; other threads must really wait
 DEFAULT_DELAY = timedelta(minutes=60)
 WAIT_LINE = re.compile(r"^\s*WAIT\b\s*(?P<kind>\S+)?\s*(?P<ref>\S+)?\s*(?P<check_by>.+)?$")
 KINDS = {"ci", "review", "deploy", "render", "date", "person", "other"}
+
+@contextmanager
+def file_lock(path, timeout: float = LOCK_TIMEOUT):
+    """Exclusive advisory lock, re-entrant within this process. Same pattern as ledger_store.file_lock.
+
+    add() and tick() are read-modify-write cycles over one JSON file. Unlocked, two concurrent adds
+    lose timers (a lost timer is a missed wake), and two overlapping ticks both deliver the same
+    timer, breaking the at-most-once promise in docs/waking.md.
+    """
+    path = Path(path).resolve()
+    held = _local.__dict__.setdefault("held", {})
+    if path in held:
+        held[path] += 1
+        try:
+            yield
+        finally:
+            held[path] -= 1
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"{path} is held by pid "
+                                       f"{(Path(path).read_text().strip() or 'unknown')}")
+                time.sleep(0.05)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"pid={os.getpid()}".encode())
+        held[path] = 1
+        try:
+            yield
+        finally:
+            del held[path]
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
 
 
 def parse_due(text: str | None, now: datetime) -> tuple[datetime, str | None]:
@@ -82,7 +130,8 @@ class Timers:
         timer = {"id": "t-" + secrets.token_hex(3), "row": row, "name": name, "due": when.isoformat(),
                  "target": target, "owner": owner, "prompt": prompt, "state": "armed",
                  "attempts": 0, "source": source, "note": note}
-        self.save(self.load() + [timer])
+        with file_lock(self.path.with_suffix(".lock")):
+            self.save(self.load() + [timer])
         return timer
 
     def from_wait(self, line: str, row: str, owner: str, now: datetime | None = None) -> dict | None:
@@ -96,7 +145,20 @@ class Timers:
                         owner=owner, source="wait-line", now=now)
 
     def tick(self, send: Callable[[str, str], str], open_rows: set[str], now: datetime | None = None) -> list[str]:
-        """Deliver due timers. Persists the `sending` mark before each send. Returns one log line per action."""
+        """Deliver due timers under one lock. Persists the `sending` mark before each send.
+
+        A second tick that starts while this one is inside `send` does not wait and does not deliver:
+        it exits, because the running tick owns the delivery. Ticks overlap whenever a send blocks on a
+        busy session, and two ticks delivering the same timer is exactly the double-message the
+        `sending` state was meant to prevent.
+        """
+        try:
+            with file_lock(self.path.with_suffix(".lock"), timeout=0):
+                return self._tick(send, open_rows, now)
+        except TimeoutError:
+            return ["another tick is running; delivered nothing"]
+
+    def _tick(self, send: Callable[[str, str], str], open_rows: set[str], now: datetime | None = None) -> list[str]:
         now = now or datetime.now(timezone.utc)
         timers, log = self.load(), []
         for t in timers:

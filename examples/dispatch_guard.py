@@ -6,15 +6,21 @@ issue tracker or agent runner. A lookup that fails becomes a warning, never a si
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
 CLAIM_TTL = timedelta(hours=6)
+LOCK_TIMEOUT = 20.0
+_local = threading.local()
 
 
 @dataclass
@@ -36,6 +42,48 @@ class Verdict:
         return not self.refusals or bool(self.override)
 
 
+@contextmanager
+def file_lock(path, timeout: float = LOCK_TIMEOUT):
+    """Exclusive advisory lock, re-entrant within this process. Same pattern as ledger_store.file_lock.
+
+    add() and tick() are read-modify-write cycles over one JSON file. Unlocked, two concurrent adds
+    lose timers (a lost timer is a missed wake), and two overlapping ticks both deliver the same
+    timer, breaking the at-most-once promise in docs/waking.md.
+    """
+    path = Path(path).resolve()
+    held = _local.__dict__.setdefault("held", {})
+    if path in held:
+        held[path] += 1
+        try:
+            yield
+        finally:
+            held[path] -= 1
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"{path} is held by pid "
+                                       f"{(Path(path).read_text().strip() or 'unknown')}")
+                time.sleep(0.05)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"pid={os.getpid()}".encode())
+        held[path] = 1
+        try:
+            yield
+        finally:
+            del held[path]
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 class Claims:
     """claims.json: {name: {"session", "worker", "at"}} where name is a row id or an issue key."""
 
@@ -49,14 +97,15 @@ class Claims:
         return {k: v for k, v in self.load().items() if now - datetime.fromisoformat(v["at"]) < CLAIM_TTL}
 
     def claim(self, names: Iterable[str], session: str, worker: str, now: datetime) -> None:
-        data = self.live(now)
-        for name in names:
-            data[name] = {"session": session, "worker": worker, "at": now.isoformat()}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=self.path.parent)
-        with os.fdopen(fd, "w") as fh:
-            json.dump(data, fh, indent=2)
-        os.replace(tmp, self.path)
+        with file_lock(self.path.with_suffix(".lock")):
+            data = self.live(now)
+            for name in names:
+                data[name] = {"session": session, "worker": worker, "at": now.isoformat()}
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent)
+            with os.fdopen(fd, "w") as fh:
+                json.dump(data, fh, indent=2)
+            os.replace(tmp, self.path)
 
 
 def guard(key: str | None, row: str, session: str, sources: Sources, claims: Claims,
