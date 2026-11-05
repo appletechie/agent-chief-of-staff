@@ -175,7 +175,7 @@ class IndependentPatchReview(unittest.TestCase):
         entries=[{"key":"ISSUE-1", "session":"other-old","at":"2026-01-16T13:00:00"},
                  {"key":"ISSUE-1", "session":"other-live", "at":"2026-01-16T13:55:00+00:00"}]
         src=dg.Sources(open_prs_naming=lambda key:(), assignee=lambda key:None,
-                       live_workers=lambda:(), recent_dispatches=lambda:key or entries)
+                       live_workers=lambda:(), recent_dispatches=lambda key: entries)
         out=dg.guard("ISSUE-1","R-001","mine",src, dg.Claims(pathlib.Path(tempfile.mkdtemp())/"claims.json"),now=T0)
         self.assertFalse(out.allowed)
         self.assertTrue(any("other-live" in s for s in out.refusals))
