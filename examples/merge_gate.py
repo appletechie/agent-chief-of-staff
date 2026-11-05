@@ -97,8 +97,11 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
     # Explicit verdict wins over phrases, but the last one rather than the first: a receipt that repeats its
     # convention before the actual decision should not be judged by the example.
     tokens = _verdict_lines(body)
-    clean = any(p in body for p in policy.clean_phrases)
+    # Line phrase matching outside the fence only; a quoted example is not evidence either.
+    clean = any(p in "\n".join(line for line in body.splitlines() if not re.match(r"\s*(?:~{3,}|`{3,})", line))
+                for p in policy.clean_phrases)
     residue = body
+    residue = re.sub(r"(?i)\bno\s+(?:major\s+)?(?:issues?|findings?|bugs?)\b", " ", residue)
     for phrase in policy.clean_phrases:
         residue = residue.replace(phrase, " ")
     # Findings anywhere in the receipt beat a clean verdict token: the token is a summary, the list is the

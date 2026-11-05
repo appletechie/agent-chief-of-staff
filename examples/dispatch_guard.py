@@ -143,8 +143,8 @@ class Claims:
             return {}
         try:
             data = json.loads(self.path.read_text())
-        except json.JSONDecodeError as error:
-            raise ClaimsCorrupt(f"claims file {self.path} is corrupt: {error.msg}")
+        except (json.JSONDecodeError, OSError, UnicodeError) as error:
+            raise ClaimsCorrupt(f"claims file {self.path} is corrupt: {str(error)}")
         if not isinstance(data, dict):
             raise ClaimsCorrupt(f"claims file {self.path} is not an object")
         return data
@@ -187,6 +187,7 @@ def guard(key: str | None, row: str, session: str, sources: Sources, claims: Cla
                     ref = (pr["repo"], pr["number"], pr["author"])
                 except (KeyError, TypeError) as error:
                     v.warnings.append(f"malformed PR record ({type(error).__name__}); continuing the search")
+                    v.refusals.append("PR search contains a malformed record; rule out a duplicate by hand")
                     continue
                 v.refusals.append(f"open PR {pr['repo']}#{pr['number']} by {pr['author']} names {key}")
         except Exception as error:
@@ -201,8 +202,13 @@ def guard(key: str | None, row: str, session: str, sources: Sources, claims: Cla
 
     try:
         for w in sources.live_workers():
+            if not isinstance(w, dict):
+                v.refusals.append(f"live worker list contains invalid {w!r}; duplicate coverage unknown")
+                continue
             if w.get("row") == row or (key and w.get("key") == key):
-                if add_worker and w.get("row") == row:
+                if w.get("id") is None:
+                    v.refusals.append("a live worker matches but lacks an id; duplicate coverage unclear")
+                elif add_worker and w.get("row") == row:
                     v.warnings.append(f"adding a second worker beside {w['id']} on {row}")
                 else:
                     v.refusals.append(f"live worker {w['id']} on {w.get('host', '?')} carries {w.get('row') or w.get('key')}")

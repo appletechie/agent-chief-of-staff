@@ -55,6 +55,9 @@ RUN_ID = re.compile(r"\b\d{6,}\b")
 COUNTS = re.compile(r"\bRan \d+\b|\b\d+\s*(?:tests?|passed|passing|failed|failures|errors|skipped)\b|\b\d+\s*/\s*\d+\b"
                     r"|\b\d+ OK\b|\bOK \(", re.I)
 CI_SUCCESS = re.compile(r"(?<![A-Za-z0-9_-])(?:success|succeeded|passed)(?![A-Za-z0-9_-])", re.I)
+# Semantically explicit qualifiers are used in actual reports (conclusion=... / HTTP status).
+CI_OUTCOME = re.compile(r"(?i)\bconclusion\s*[=:]\s*[A-Za-z_ -]+")
+CI_REDWORDS = re.compile(r"(?i)\b(?:failure|failures|failing|failed|cancelled?|canceled|timed[_ -]?out|timeout)\b")
 # Explicit failure words beat "success" elsewhere in the same evidence string (a cancelled step is not green).
 FAILURE = re.compile(r"\bFAILED\b|\berrors?\b|\b(?:cancel+ed|timed[ -]?out)\b", re.I)
 FAILURE_COUNT = re.compile(r"(?i)(?<![a-z0-9_-])([1-9][0-9]*)(?:\s+(?:failed|failures?|errors?))\b")
@@ -270,8 +273,12 @@ class Ledger:
                 archive.write_text("| id | key | closed | proof | last next action |\n|---|---|---|---|---|\n")
             # store the proof's full text in the row's note before the archive (a table) cuts or rewrites it.
             self.notes.mkdir(parents=True, exist_ok=True)
-            with (self.notes / f"{row_id}.md").open("a") as note:
-                note.write(f"\n## proof\nkind: {kind}\nref: {ref}\n{text}\n")
+            note_path = self.notes / f"{row_id}.md"
+            cell = f"\n## proof\nkind: {kind}\nref: {ref}\n{text}\n"
+            # A crash after this append, retried before the archive append, must not duplicate history.
+            if not note_path.exists() or cell.lstrip() not in note_path.read_text():
+                with note_path.open("a") as note:
+                    note.write(cell)
             with archive.open("a") as fh:
                 fh.write(table_line([row_id, row["key"], f"{now:%Y-%m-%d %H:%MZ}", clean(str(proof)), row["next"]]) + "\n")
             del lines[row["_line"] - 1]
@@ -383,7 +390,8 @@ def not_proof(value: str) -> bool:
 
 def ref_without_zero_failures(value: str) -> str:
     """Remove explicitly zero-failure runs before looking for red words, so `0 failures` is still green."""
-    return re.sub(r"(?i)(?<![a-z0-9_-])0\s+(?:failed|failures?|errors?)\b", " ", value)
+    value = re.sub(r"(?i)\b(?:no|not)\s+(?:error|errors?|failure|failed|failures?)\b", " ", value)
+    return re.sub(r"(?i)(?<![a-z0-9_-])0\s+(?:failed|failure|failures?|errors?)\b", " ", value)
 
 
 def proof_problem(kind: str, ref: str, text: str) -> str | None:
@@ -410,15 +418,41 @@ def proof_problem(kind: str, ref: str, text: str) -> str | None:
         return "the ref must not contain ' - ' (it separates ref from text in the archive)"
     if not_proof(ref) or not_proof(text):
         return f"{ref if not_proof(ref) else text!r} is a claim, not proof"
-    if kind in {"tests", "ci", "deployed"} and (FAILURE.search(ref_without_zero_failures(f"{ref} {text}")) or FAILURE_COUNT.search(f"{ref} {text}")):
+    if kind in {"tests", "ci", "deployed"} and FAILURE.search(ref_without_zero_failures(f"{ref} {text}")):
         return f"the proof reports a failure ({ref} {text}); a failed or cancelled check is not completed work"
     if kind == "tests" and not (COUNTS.search(ref) or RUN_ID.search(ref)):
         return "a tests proof needs the counts or a run id, not prose"
-    if kind == "ci" and not ((RUN_ID.search(ref) or SHA.search(ref)) and CI_SUCCESS.search(ref)):
-        return "a ci proof needs a run id or head SHA plus the conclusion (success)"
+    if kind == "tests":
+        failure_y = CI_REDWORDS.search(ref_without_zero_failures(ref))
+        if failure_y:
+            return "a ci/test proof cannot say failed without dismissing those as absent"
+        exit_code = re.search(r"(?i)\bexit(?:\s+code)?[: ]+(-?\d+)", ref)
+        if exit_code and int(exit_code.group(1)) != 0:
+            return "a tests proof requires exit 0"
+        ratio = re.search(r"\b(\d+)\s*/\s*(\d+)\b", ref)
+        if ratio and int(ratio.group(1)) != int(ratio.group(2)):
+            return "a tests proof's successful/total counts do not agree"
+        if ref.lower().strip() in {"skipped", "all skipped"} or re.search(r"(?i)\ball\s+tests?\s+skipped\b", f"{ref} {text}"):
+            return "a skipped test suite proves no test ran"
+    if kind == "ci":
+        after_conclusion = CI_OUTCOME.split(ref, maxsplit=1)[-1].strip() if CI_OUTCOME.search(ref) else ""
+        if after_conclusion and not CI_SUCCESS.match(after_conclusion):
+            return "a ci proof's explicit conclusion must be success, not " + after_conclusion[:40]
+        known_red = any(phrase in ref.lower() for phrase in ("not a success", "no success", "not successful", "without success"))
+        red_unless_negated = bool(CI_REDWORDS.search(re.sub(r"(?i)\bno\s+(?:failure|failures|errors?|failed|failing)\b", "", ref)))
+        if known_red or red_unless_negated:
+            return "a ci proof cannot contain a red or negated outcome"
+        if not ((RUN_ID.search(ref) or SHA.search(ref)) and CI_SUCCESS.search(ref)):
+            return "a ci proof needs a run id or head SHA plus the conclusion (success)"
     if kind == "merged" and not re.fullmatch(r"[0-9a-f]{7,40}", ref):
         return "a merged proof is the merge commit SHA"
     if kind == "deployed":
+        if re.search(r"(?i)\b(?:not |un)healthy\b", ref):
+            return "a deployed proof must not report unhealthy"
+        if LIVE_STATUS.search(ref) and LIVE_STATUS.search(ref).group(0).isdigit() and not 200 <= int(LIVE_STATUS.search(ref).group(0)) < 400:
+            return "a deployed proof's live check must be a successful status (it reported " + LIVE_STATUS.search(ref).group(0) + ")"
+        if not re.search(r"(?i)(?:not healthy|unhealthy|unhealthy)", ref):
+            pass
         if not any(ID_TOKEN.search(ref[:m.start()] + " " + ref[m.end():]) for m in LIVE_STATUS.finditer(ref)):
             return "a deployed proof needs a deploy or run id plus a live check status"
     if kind == "config" and not READ_BACK.search(ref):

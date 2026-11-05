@@ -233,7 +233,7 @@ class Timers:
         when, note = parse_due(due, now)
         with self._fenced(expect_epoch), file_lock(self.lock):
             timers = self.load()
-            taken = {t.get("id") for t in timers if isinstance(t, dict)}
+            taken = {t["id"] for t in timers if isinstance(t, dict) and isinstance(t.get("id"), str)}
             # token_hex collision is rare; a pasted, broken or exhausted RNG must not wedge the store with a
             # never-ending redraw while it holds lock.
             for _ in range(10):

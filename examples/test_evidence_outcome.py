@@ -179,3 +179,57 @@ class IndependentPatchReview(unittest.TestCase):
         out=dg.guard("ISSUE-1","R-001","mine",src, dg.Claims(pathlib.Path(tempfile.mkdtemp())/"claims.json"),now=T0)
         self.assertFalse(out.allowed)
         self.assertTrue(any("other-live" in s for s in out.refusals))
+
+class BroadIndependentPass(unittest.TestCase):
+    def test_false_green_proofs_are_rejected_and_true_evidence_kept(self):
+        bad = [
+          ("ci", "run 123456: no success", "head run completed"),
+          ("ci", "run 123456: success; integration failure", "CI report on head"),
+          ("deployed", "deploy-12345 status 503", "GET /readyz returned HTTP 503"),
+          ("deployed", "deploy-12345 not healthy", "flow observed unavailable"),
+          ("tests", "1 skipped", "all tests skipped"),
+          ("tests", "63/64 passing", "suite completed"),
+          ("tests", "exit 1: 12 passed", "suite on head"),
+        ]
+        for k,r,t in bad:
+            self.assertIsNotNone(ls.proof_problem(k,r,t), (k,r,t))
+        self.assertIsNone(ls.proof_problem("ci", "run 123456 SUCCESS", "no errors; no failures"))
+        self.assertIsNone(ls.proof_problem("deployed", "deploy-12345 status 200", "health and live flow passed"))
+
+    def test_fenced_non_instructions_do_not_change_the_verdict(self):
+        pr=mg.PR("o/a", 1, "t", "", "a"*40, False,True,{"ci":"success"},
+                 [mg.Review("a"*40, "verdict: clean\nNo issues found.")],0,T0)
+        self.assertEqual(mg.decide(pr,"",mg.Policy(frozenset()),T0).action,"MERGE")
+
+    def test_an_invalid_record_is_enough_to_trigger_a_safe_stop(self):
+        import dispatch_guard as dg
+        for field in ("open_prs_naming","live_workers"):
+            if field=="open_prs_naming":
+                src=dg.Sources(open_prs_naming=lambda k:[{}],assignee=lambda k:None,live_workers=lambda:())
+            else:
+                src=dg.Sources(open_prs_naming=lambda k:(),assignee=lambda k:None,live_workers=lambda:[None])
+            out=dg.guard("K","R","s",src,dg.Claims(pathlib.Path(tempfile.mkdtemp())/"state"),now=T0)
+            self.assertFalse(out.allowed)
+        src=dg.Sources(open_prs_naming=lambda k:(),assignee=lambda k:None,live_workers=lambda:[None,{"row":"R"}])
+        out=dg.guard(None,"R","s",src,dg.Claims(pathlib.Path(tempfile.mkdtemp())/"state"),now=T0)
+        self.assertFalse(out.allowed)
+
+    def test_claims_and_foreign_timer_inputs_do_not_grafts_tracebacks(self):
+        import dispatch_guard as dg
+        path=pathlib.Path(tempfile.mkdtemp())/"claims.json"; path.write_bytes(b"\xff\xfe")
+        out=dg.guard("K","R","s",dg.Sources(open_prs_naming=lambda k:(),assignee=lambda k:None,live_workers=lambda:()),dg.Claims(path),now=T0)
+        self.assertFalse(out.allowed)
+        store=tm.Timers(root=pathlib.Path(tempfile.mkdtemp())/"timers.json") if False else tm.Timers(pathlib.Path(tempfile.mkdtemp())/"timers.json")
+        store.path.write_text(json.dumps([{"id":[]}]))
+        # Unrelated malformed ids aren't identity references, so skip them but never put an Unhashable into a set.
+        row=store.add("R","+1m","n","p",now=T0)
+        assert row["id"].startswith("t-")
+
+    def test_note_replay_retains_one_history(self):
+        root=pathlib.Path(tempfile.mkdtemp()); ledger=ls.Ledger(root)
+        row=ledger.write_row(None,next="no duplicate note")
+        note_path=root/"ledger"/"notes"/"R-001.md"; note_path.parent.mkdir(parents=True)
+        # exact state a crash after the note append but before the archive append leaves behind
+        note_path.write_text("\n## proof\nkind: tests\nref: run 123456\n12 passed\n")
+        ledger.close_row(row["id"],"tests","run 123456","12 passed",now=T0)
+        self.assertEqual(note_path.read_text().count("## proof"),1)
