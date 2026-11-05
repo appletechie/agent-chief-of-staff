@@ -161,6 +161,17 @@ class Timers:
             raise TimersCorrupt(f"{self.path}: timers.json is corrupt (line {error.lineno} column {error.colno})") from error
         if not isinstance(timers, list) or any(not isinstance(t, dict) or "id" not in t for t in timers):
             raise TimersCorrupt(f"{self.path}: expected an array of timer objects")
+        for t in timers:
+            for field in ("id", "state", "row", "due"):
+                if not isinstance(t.get(field), str) or not t[field].strip():
+                    raise TimersCorrupt(f"{self.path}: timer field {field!r} is missing or has the wrong type")
+            try:
+                if datetime.fromisoformat(t["due"]).tzinfo is None:
+                    raise ValueError('due date must carry a time zone')
+                if t.get("first_attempt_at") and datetime.fromisoformat(t["first_attempt_at"]).tzinfo is None:
+                    raise ValueError('first attempt must carry a time zone')
+            except (ValueError, TypeError) as error:
+                raise TimersCorrupt(f"{self.path}: timer {t['id']} has an invalid timestamp: {error}") from error
         return timers
 
     def save(self, timers: list[dict]) -> None:

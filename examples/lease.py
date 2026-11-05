@@ -98,6 +98,19 @@ class Lease:
             raise LeaseError(f"state file {self.path} is corrupt: {error.lineno}:{error.colno} {error.msg}; recover it before running the lease") from error
         if not isinstance(lease, dict):
             raise LeaseError(f"state file {self.path} is not an object (got {type(lease).__name__})")
+        # Valid JSON is not enough: fields this module reads must hold the values it expects, or the lease must
+        # refuse, rather than crash the caller with a KeyError / TypeError from deep inside a state operation.
+        for field in ("primary", "renewed_at", "ttl_s"):
+            if not isinstance(lease.get(field), str) if field != "ttl_s" else not isinstance(lease.get(field), int):
+                raise LeaseError(f"state file {self.path}: {field!r} is missing or has the wrong type")
+        try:
+            stable = datetime.fromisoformat(str(lease["renewed_at"]))
+            if stable.tzinfo is None:
+                raise ValueError("renewed_at must carry a time zone")
+            if int(lease["ttl_s"]) <= 0:
+                raise ValueError("ttl_s must be positive")
+        except ValueError as error:
+            raise LeaseError(f"state file {self.path}: {error}") from error
         return lease
 
     def _write(self, data: dict) -> dict:

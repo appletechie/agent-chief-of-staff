@@ -111,6 +111,14 @@ class Claims:
             raise ClaimsCorrupt(f"claims file {self.path} is corrupt: {error.msg}")
         if not isinstance(data, dict):
             raise ClaimsCorrupt(f"claims file {self.path} is not an object")
+        for name, claim in data.items():
+            if not isinstance(claim, dict) or not isinstance(claim.get("session"), str):
+                raise ClaimsCorrupt(f"claims file {self.path}: claim {name!r} is missing a session")
+            try:
+                if datetime.fromisoformat(str(claim.get("at", ""))).tzinfo is None:
+                    raise ValueError('the timestamp must carry a time zone')
+            except (ValueError, TypeError) as error:
+                raise ClaimsCorrupt(f"claims file {self.path}: {name!r} has an invalid timestamp") from error
         return data
 
     def live(self, now: datetime) -> dict:

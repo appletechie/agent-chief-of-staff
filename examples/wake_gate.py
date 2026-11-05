@@ -49,7 +49,11 @@ class Result:
 
 def evaluate(collectors: dict[str, Collector], previous: dict, now: datetime,
              max_quiet: timedelta = timedelta(hours=4), new_only: frozenset = frozenset()) -> Result:
+    # Shape-check before reading: JSON itself may be well-formed and this field still unusable. An unknown legacy
+    # shape looks like a pass to the caller, never like absence of a change to the caller's stale view.
     old_parts = previous.get("parts", {})
+    if not isinstance(old_parts, dict):
+        old_parts = {}
     parts, lines = {}, []
     for name, collect in collectors.items():
         try:
@@ -72,7 +76,20 @@ def evaluate(collectors: dict[str, Collector], previous: dict, now: datetime,
     lines = lines or []
     if "__unreadable__" in previous:
         lines.append(f"previous snapshot unreadable: {previous['__unreadable__']}")
-    last_pass = previous.get("last_changed_at")
+    # JSON can be well-formed and still semantically invalid (malformed dates, mismatched types). Treat it like
+    # an unreadable snapshot, not a crash: it is always safer to run a pass than to stop waking.
+    try:
+        last_pass = previous.get("last_changed_at")
+        if last_pass is not None:
+            parsed_last = datetime.fromisoformat(last_pass)
+            if parsed_last.tzinfo is None:
+                raise ValueError("the timestamp is missing a time zone")
+    except (ValueError, TypeError) as error:
+        lines.append(f"previous snapshot has an invalid last pass: {error}; forcing a pass")
+        last_pass = None
+    if not isinstance(previous.get("parts", {}), dict):
+        lines.append("previous snapshot part list is not an object; forcing a pass")
+        previous = {k: v for k, v in previous.items() if k != "parts"}
     if last_pass and datetime.fromisoformat(last_pass) > now:
         lines.append(f"last pass {last_pass} is in the future; forcing a pass")
         last_pass = now.isoformat()  # clamp: never save a future time
