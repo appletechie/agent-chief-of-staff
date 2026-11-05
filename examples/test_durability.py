@@ -188,7 +188,7 @@ class LeaseFenceTests(TempDir):
         before = led.path.read_text()
         for attempt in (lambda: led.write_row(None, next="stale primary writes anyway", expect_epoch=self.old),
                         lambda: led.write_row(row["id"], next="stale edit", expect_epoch=self.old),
-                        lambda: led.close_row(row["id"], proof="stale close", expect_epoch=self.old),
+                        lambda: led.close_row(row["id"], "merged", "abc1234", "stale close", expect_epoch=self.old),
                         lambda: led.write_row(None, next="no epoch at all")):
             with self.assertRaises(ls.StaleEpoch):
                 attempt()
@@ -405,7 +405,7 @@ class FenceSmallFindingsTests(TempDir):
         with self.assertRaises(ValueError):
             led.write_row(None, expect_epoch=999, next="caller thinks it is fenced")
         with self.assertRaises(ValueError):
-            led.close_row("R-001", proof="p", expect_epoch=999)
+            led.close_row("R-001", "merged", "abc1234", "caller thinks it is fenced", expect_epoch=999)
         self.assertEqual(led.rows(), [])
         store = tm.Timers(self.root / "t.json")
         with self.assertRaises(ValueError):

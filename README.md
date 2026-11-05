@@ -72,7 +72,7 @@ The design below is a set of small, boring mechanisms that close each of these g
 1. **Files are the record, the conversation is not.** Any session must be able to rebuild full state from disk and live systems. Context windows get compacted; ledgers do not.
 2. **Scripts poll, the model decides.** Polling with an LLM is slow, expensive and forgetful. A deterministic script hashes state and wakes the model on change.
 3. **One system per job.** One ledger, one dashboard (generated from the ledger), one place for history, one owner per item. Parallel trackers drift.
-4. **Done means proven.** A row closes on evidence the coordinator read itself: an exit code with a count, a CI conclusion on the head commit, a read-back, a live request. A worker's "verified" is a claim, not proof.
+4. **Done means proven.** A row closes on evidence the coordinator read itself: an exit code with a count, a CI conclusion on the head commit, a read-back, a live request. A worker's "verified" is a claim, not proof, and `close_row` refuses it: proof is a kind plus a checkable ref.
 5. **Guard the irreversible, automate the reversible.** Anything with a backup, a read-back and a one-command rollback can run without asking. Money, people outside the team, production data, secrets and deletes always go to the owner.
 6. **Every timed step is a durable timer.** Never an in-memory sleep, never a one-shot wake that silently fails when the target is busy.
 7. **Single writer, many readers.** One primary coordinator holds a lease. Other sessions may read everything and write only through locked paths.
@@ -99,7 +99,7 @@ Small, dependency-free Python sketches (standard library only, POSIX file locks)
 | file | what it shows |
 |---|---|
 | [examples/LEDGER.example.md](examples/LEDGER.example.md) | A ledger file with rows in every queue |
-| [examples/ledger_store.py](examples/ledger_store.py) | Locked row writes, spill to notes, close with proof, never-reused ids, queue assignment, the checker |
+| [examples/ledger_store.py](examples/ledger_store.py) | Locked row writes, spill to notes, close with structured proof, never-reused ids, queue assignment, the checker |
 | [examples/wake_gate.py](examples/wake_gate.py) | Hash durable state, compare to the last snapshot, decide CHANGED / UNCHANGED |
 | [examples/timers.py](examples/timers.py) | Durable at-most-once timers (locked adds, one tick at a time) and the `WAIT` line parser |
 | [examples/dispatch_guard.py](examples/dispatch_guard.py) | The duplicate-dispatch guard with locked, test-and-set claims |
