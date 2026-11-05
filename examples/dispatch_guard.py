@@ -2,7 +2,8 @@
 """Duplicate-dispatch guard: refuse to start a worker when the work is already under way.
 
 Every external lookup is injected, so the guard is testable offline and works with any VCS host,
-issue tracker or agent runner. A lookup that fails becomes a warning, never a silent pass.
+issue tracker or agent runner. A lookup that fails becomes a warning, never a silent pass; a failed or malformed open-PR
+search refuses, since it cannot rule out a competing PR (override with a reason).
 
 Claims are written under an exclusive lock, and claim() refuses a name another session holds, so two sessions
 that both passed guard() at the same moment cannot both claim the same row: the second claim raises ClaimHeld.
@@ -143,8 +144,8 @@ class Claims:
             return {}
         try:
             data = json.loads(self.path.read_text())
-        except json.JSONDecodeError as error:
-            raise ClaimsCorrupt(f"claims file {self.path} is corrupt: {error.msg}")
+        except (json.JSONDecodeError, OSError, UnicodeError) as error:
+            raise ClaimsCorrupt(f"claims file {self.path} is corrupt: {str(error)}")
         if not isinstance(data, dict):
             raise ClaimsCorrupt(f"claims file {self.path} is not an object")
         return data
@@ -183,9 +184,14 @@ def guard(key: str | None, row: str, session: str, sources: Sources, claims: Cla
     if key:
         try:
             for pr in sources.open_prs_naming(key):
+                # each record stands alone: a malformed one refuses, and never hides a valid one after it (#22)
+                if not isinstance(pr, dict) or not all(k in pr for k in ("repo", "number", "author")):
+                    v.refusals.append(f"PR search returned a malformed record ({str(pr)[:60]!r}); duplicate PRs not ruled out")
+                    continue
                 v.refusals.append(f"open PR {pr['repo']}#{pr['number']} by {pr['author']} names {key}")
         except Exception as error:
             v.warnings.append(f"PR search failed ({type(error).__name__}); duplicate PRs not ruled out")
+            v.refusals.append(f"PR search failed ({type(error).__name__}); duplicate PRs not ruled out")
         try:
             who = sources.assignee(key)
             if who and who not in sources.allowed_assignees:
@@ -195,8 +201,13 @@ def guard(key: str | None, row: str, session: str, sources: Sources, claims: Cla
 
     try:
         for w in sources.live_workers():
+            if not isinstance(w, dict):
+                v.refusals.append(f"live worker list contains invalid {w!r}; duplicate coverage unknown")
+                continue
             if w.get("row") == row or (key and w.get("key") == key):
-                if add_worker and w.get("row") == row:
+                if w.get("id") is None:
+                    v.refusals.append("a live worker matches but lacks an id; duplicate coverage unclear")
+                elif add_worker and w.get("row") == row:
                     v.warnings.append(f"adding a second worker beside {w['id']} on {row}")
                 else:
                     v.refusals.append(f"live worker {w['id']} on {w.get('host', '?')} carries {w.get('row') or w.get('key')}")
@@ -208,9 +219,17 @@ def guard(key: str | None, row: str, session: str, sources: Sources, claims: Cla
     try:
         cutoff = now - CLAIM_TTL
         for dispatch in sources.recent_dispatches(key or ""):
+            # each record stands alone: one without a usable time is skipped with a warning, and the rest are
+            # still checked (a naive time used to abort the whole lookup and hide a later live dispatch, #22)
+            if not isinstance(dispatch, dict):
+                v.warnings.append(f"recent dispatch record is not an object ({type(dispatch).__name__}); skipped")
+                continue
             if dispatch.get("session") == session:
                 continue
-            when = datetime.fromisoformat(dispatch["at"])
+            when = aware(dispatch.get("at"))
+            if when is None:
+                v.warnings.append(f"recent dispatch at {str(dispatch.get('at'))[:40]!r} has no time zone or does not parse; skipped")
+                continue
             if when >= cutoff:
                 v.refusals.append(f"recent dispatch for {dispatch.get('key') or key} by session {dispatch.get('session')} at {dispatch['at']}")
     except Exception as error:

@@ -256,12 +256,17 @@ class GuardTests(TempDir):
         v = dg.guard("ISSUE-1", "R-001", "s1", self.sources(), dg.Claims(self.root / "c.json"), now=T0)
         self.assertTrue(v.allowed)
 
-    def test_failed_lookup_is_a_warning(self):
+    def test_failed_lookup_is_a_warning_and_a_failed_pr_search_refuses(self):
         def boom(_):
             raise TimeoutError
         src = dg.Sources(open_prs_naming=boom, assignee=lambda k: None, live_workers=lambda: [])
         v = dg.guard("ISSUE-1", "R-001", "s1", src, dg.Claims(self.root / "c.json"), now=T0)
         self.assertTrue(v.warnings)
+        self.assertFalse(v.allowed)  # #22: a dead PR source cannot rule out a competing PR
+        src = dg.Sources(open_prs_naming=lambda k: [], assignee=boom, live_workers=lambda: [])
+        v = dg.guard("ISSUE-1", "R-001", "s1", src, dg.Claims(self.root / "c.json"), now=T0)
+        self.assertTrue(v.warnings)
+        self.assertTrue(v.allowed)
 
     def test_other_sessions_claim_refuses_until_ttl(self):
         claims = dg.Claims(self.root / "c.json")
