@@ -61,6 +61,15 @@ def aware(value) -> datetime | None:
     return when if when.utcoffset() is not None else None
 
 
+def clock(now: datetime | None) -> datetime:
+    """now, or the current UTC time. A naive clock would write a naive time that every later read rejects: refuse it."""
+    if now is None:
+        return datetime.now(timezone.utc)
+    if not isinstance(now, datetime) or now.utcoffset() is None:
+        raise ValueError("lease writes need an aware time (datetime.now(timezone.utc), not datetime.now())")
+    return now
+
+
 def whole(value, minimum: int = 1) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
 
@@ -149,7 +158,7 @@ class Lease:
         return data
 
     def state(self, now: datetime | None = None) -> str:
-        now = now or datetime.now(timezone.utc)
+        now = clock(now)
         lease = self.read()
         if not lease:
             return "none"
@@ -174,7 +183,7 @@ class Lease:
             yield self.epoch()
 
     def init(self, session_id: str, host: str, now: datetime | None = None) -> dict:
-        now = now or datetime.now(timezone.utc)
+        now = clock(now)
         with file_lock(self.lock):
             if self.read():
                 raise LeaseError(f"lease exists (primary {self.holder()}); use take()")
@@ -186,14 +195,14 @@ class Lease:
             lease = self.read()
             if not lease or lease["primary"] != session_id:
                 raise LeaseError(f"{session_id} does not hold the lease")
-            lease["renewed_at"] = (now or datetime.now(timezone.utc)).isoformat()
+            lease["renewed_at"] = clock(now).isoformat()
             return self._write(lease)
 
     def take(self, session_id: str, host: str, reason: str, now: datetime | None = None,
              force: bool = False) -> dict:
         if not reason.strip():
             raise LeaseError("a takeover needs a reason")
-        now = now or datetime.now(timezone.utc)
+        now = clock(now)
         with file_lock(self.lock):
             state = self.state(now)
             if state == "held" and not force:

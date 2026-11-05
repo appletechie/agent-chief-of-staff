@@ -54,6 +54,15 @@ def aware(value) -> datetime | None:
     return when if when.utcoffset() is not None else None
 
 
+def clock(now: datetime | None) -> datetime:
+    """now, or the current UTC time. A naive clock would write a naive time that every later read rejects: refuse it."""
+    if now is None:
+        return datetime.now(timezone.utc)
+    if not isinstance(now, datetime) or now.utcoffset() is None:
+        raise ValueError("claims need an aware time (datetime.now(timezone.utc), not datetime.now())")
+    return now
+
+
 def claim_problem(claim) -> str | None:
     """Why a claim record can't be trusted, or None."""
     if not isinstance(claim, dict):
@@ -147,7 +156,7 @@ class Claims:
     def claim(self, names: Iterable[str], session: str, worker: str, now: datetime,
               override: str | None = None) -> None:
         """Claim every name or none. A name another session holds refuses unless override gives a reason."""
-        names = list(names)
+        names, now = list(names), clock(now)
         with file_lock(self.lock):
             data = self.live(now)
             taken = [f"{n} (invalid claim: {claim_problem(data[n])})" if claim_problem(data[n]) else
@@ -166,7 +175,7 @@ class Claims:
 
 def guard(key: str | None, row: str, session: str, sources: Sources, claims: Claims,
           now: datetime | None = None, add_worker: bool = False, allow_duplicate: str | None = None) -> Verdict:
-    now = now or datetime.now(timezone.utc)
+    now = clock(now)
     v = Verdict()
     if allow_duplicate is not None and not allow_duplicate.strip():
         raise ValueError("--allow-duplicate needs a reason")

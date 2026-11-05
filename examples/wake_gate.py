@@ -51,6 +51,15 @@ def aware(value) -> datetime | None:
     return when if when.utcoffset() is not None else None
 
 
+def clock(now: datetime | None) -> datetime:
+    """now, or the current UTC time. A naive clock would write a naive time that every later read rejects: refuse it."""
+    if now is None:
+        return datetime.now(timezone.utc)
+    if not isinstance(now, datetime) or now.utcoffset() is None:
+        raise ValueError("the wake gate and its snapshot need an aware time (datetime.now(timezone.utc), not datetime.now())")
+    return now
+
+
 def check_snapshot(previous) -> tuple[dict, list[str]]:
     """(snapshot, problems): drop each field evaluate() can't trust and say why. Any problem means CHANGED."""
     if previous is None:
@@ -87,6 +96,7 @@ class Result:
 
 def evaluate(collectors: dict[str, Collector], previous: dict, now: datetime,
              max_quiet: timedelta = timedelta(hours=4), new_only: frozenset = frozenset()) -> Result:
+    now = clock(now)
     first = previous is None or previous == {}
     previous, problems = check_snapshot(previous)
     old_parts = previous["parts"]
@@ -135,7 +145,7 @@ def run(collectors: dict[str, Collector], state_path: Path, persist: bool, now: 
         **kwargs) -> Result:
     if fence is None and expect_epoch is not None:
         raise ValueError("expect_epoch passed but no fence is configured; the save would not be fenced")
-    now = now or datetime.now(timezone.utc)
+    now = clock(now)
     state_path = Path(state_path)
     try:
         previous = json.loads(state_path.read_text()) if state_path.exists() else {}

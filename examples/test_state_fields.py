@@ -227,7 +227,8 @@ class ClaimFields(TempDir):
 
 
 class NaiveClock(unittest.TestCase):
-    """karutoil's #18 follow-up: a naive clock is refused at the timer boundary, before it can write a naive due."""
+    """A naive clock is refused before it can write a naive time (timers: karutoil's #18 follow-up; lease, wake gate
+    and claims: Codex on #21)."""
 
     def test_add_tick_and_wait_refuse_a_naive_clock(self):
         with tempfile.TemporaryDirectory() as root:
@@ -241,6 +242,36 @@ class NaiveClock(unittest.TestCase):
                 store.tick(lambda target, text: self.fail("sent on a naive clock"), {"R-001"}, now=datetime(2026, 1, 16, 15, 0))
             with self.assertRaises(ValueError):
                 tm.parse_wait("WAIT ci org/app#88 +45m", datetime(2026, 1, 16, 14, 0))
+
+    def test_lease_writes_refuse_a_naive_clock_and_the_lease_stays_valid(self):
+        with tempfile.TemporaryDirectory() as root:
+            lease = lz.Lease(pathlib.Path(root) / "lease.json")
+            with self.assertRaises(ValueError):
+                lease.init("a", "h", now=datetime(2026, 1, 16, 14, 0))
+            self.assertFalse(lease.path.exists())
+            lease.init("a", "h", now=T0)
+            before = lease.path.read_text()
+            with self.assertRaises(ValueError):
+                lease.renew("a", now=datetime(2026, 1, 16, 15, 0))
+            with self.assertRaises(ValueError):
+                lease.take("b", "h2", "handover", now=datetime(2026, 1, 16, 19, 0), force=True)
+            self.assertEqual(lease.path.read_text(), before)
+            lease.renew("a", now=T0 + timedelta(minutes=5))
+            self.assertEqual(lease.state(T0 + timedelta(minutes=10)), "held")
+
+    def test_wake_gate_and_claims_refuse_a_naive_clock(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = pathlib.Path(root)
+            with self.assertRaises(ValueError):
+                wg.run({}, root / "wake-gate.json", persist=True, now=datetime(2026, 1, 16, 14, 0))
+            self.assertFalse((root / "wake-gate.json").exists())
+            claims = dg.Claims(root / "claims.json")
+            with self.assertRaises(ValueError):
+                claims.claim(["R-001"], "me", "w1", datetime(2026, 1, 16, 14, 0))
+            self.assertFalse(claims.path.exists())
+            sources = dg.Sources(open_prs_naming=lambda k: [], assignee=lambda k: None, live_workers=lambda: [])
+            with self.assertRaises(ValueError):
+                dg.guard(None, "R-001", "me", sources, claims, now=datetime(2026, 1, 16, 14, 0))
 
 
 if __name__ == "__main__":
