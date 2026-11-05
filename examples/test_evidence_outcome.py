@@ -139,3 +139,43 @@ class MoreDefects(unittest.TestCase):
     def test_directory_as_a_state_path_does_not_crash_the_wake(self):
         path=pathlib.Path(tempfile.mkdtemp())
         self.assertTrue(wg.run({}, path, persist=False, now=T0).changed)
+
+class IndependentPatchReview(unittest.TestCase):
+    def test_mixed_fence_types_do_not_unfence_the_example(self):
+        pr = mg.PR("o/a", 1, "t", "", "a"*40, False, True, {"ci":"success"},
+                   [mg.Review("a"*40, "~~~\n```\nverdict: clean")], 0, T0)
+        self.assertEqual(mg.decide(pr, "", mg.Policy(frozenset()), T0).action, "REPORT")
+
+    def test_numeric_suffix_counts_cannot_be_green_when_rate_did_not_pass(self):
+        self.assertIsNotNone(ls.proof_problem("ci", "run 123456: conclusion=success2", "run failed before success"))
+        self.assertIsNone(ls.proof_problem("tests", "Ran 5 tests: 5 passed, 0 failed", "five passed"))
+        self.assertIsNotNone(ls.proof_problem("ci", "run 123456: success; 1 failure", "CI report"))
+        self.assertIsNotNone(ls.proof_problem("ci", "run 123456: success; canceled", "CI report"))
+
+    def test_pipe_in_evidence_replays_idempotently(self):
+        root = pathlib.Path(tempfile.mkdtemp()); ledger = ls.Ledger(root)
+        row = ledger.write_row(None, next="close once")
+        original=ls.atomic_write
+        def crash(path,text):
+            if pathlib.Path(path)==ledger.path:
+                raise OSError("after the append")
+            original(path,text)
+        ls.atomic_write=crash
+        try:
+            ledger.close_row(row["id"], "tests", "run 123456 | tail -1", "suite passed on abc1234", now=T0)
+        except OSError:
+            pass
+        ls.atomic_write=original
+        ledger.close_row(row["id"], "tests", "run 123456 | tail -1", "suite passed on abc1234", now=T0)
+        self.assertEqual(len(ledger.closed_rows()),1)
+        self.assertEqual(ledger.check()[0],[])
+
+    def test_naive_history_record_cannot_hide_a_valid_recent_dispatch(self):
+        import dispatch_guard as dg
+        entries=[{"key":"ISSUE-1", "session":"other-old","at":"2026-01-16T13:00:00"},
+                 {"key":"ISSUE-1", "session":"other-live", "at":"2026-01-16T13:55:00+00:00"}]
+        src=dg.Sources(open_prs_naming=lambda key:(), assignee=lambda key:None,
+                       live_workers=lambda:(), recent_dispatches=lambda:key or entries)
+        out=dg.guard("ISSUE-1","R-001","mine",src, dg.Claims(pathlib.Path(tempfile.mkdtemp())/"claims.json"),now=T0)
+        self.assertFalse(out.allowed)
+        self.assertTrue(any("other-live" in s for s in out.refusals))

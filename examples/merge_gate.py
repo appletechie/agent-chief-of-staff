@@ -71,12 +71,19 @@ def _verdict_lines(body: str) -> list[str]:
     bare search would treat an illustrating code block as the verdict. Fenced regions are not instructions to
     the gate.
     """
-    out, fence = [], False
+    out, fence, fence_size = [], None, 0
     for line in body.splitlines():
-        if line.lstrip().startswith(("```", "~~~")):
-            fence = not fence
-            continue
-        if not fence and (m := VERDICT_LINE.match(line)):
+        # Markdown's tilde and backtick fences are independent worlds: a backtick line inside a tilde example
+        # must not expose the example's instructions to the gate. Close only at a delimiter of the same shape.
+        if opener := re.match(r"^\s*(`{3,}|~{3,})", line):
+            here = opener.group(1)
+            if fence is None:
+                fence, fence_size = here[0], len(here)
+                continue
+            if fence == here[0] and len(here) >= fence_size:
+                fence, fence_size = None, 0
+                continue
+        if fence is None and (m := VERDICT_LINE.match(line)):
             out.append(m.group(1))
     return out
 

@@ -54,10 +54,10 @@ SHA = re.compile(r"\b[0-9a-f]{7,40}\b")
 RUN_ID = re.compile(r"\b\d{6,}\b")
 COUNTS = re.compile(r"\bRan \d+\b|\b\d+\s*(?:tests?|passed|passing|failed|failures|errors|skipped)\b|\b\d+\s*/\s*\d+\b"
                     r"|\b\d+ OK\b|\bOK \(", re.I)
-CI_SUCCESS = re.compile(r"(?<![A-Za-z_-])(success|succeeded|passed|passed with( failures)?)(?![A-Za-z_-])", re.I)
+CI_SUCCESS = re.compile(r"(?<![A-Za-z0-9_-])(?:success|succeeded|passed)(?![A-Za-z0-9_-])", re.I)
 # Explicit failure words beat "success" elsewhere in the same evidence string (a cancelled step is not green).
-FAILURE = re.compile(r"(?i)(?<![A-Za-z_-])FAILED\b|\bERROR?:?\b|\bCANCELLED?\b|\bTIMED[ -]?OUT\b"
-                     r"|\b(?:[1-9]\d*\s+(?:fail(?:ed|ures)?|errors?))\b")
+FAILURE = re.compile(r"\bFAILED\b|\berrors?\b|\b(?:cancel+ed|timed[ -]?out)\b", re.I)
+FAILURE_COUNT = re.compile(r"(?i)(?<![a-z0-9_-])([1-9][0-9]*)(?:\s+(?:failed|failures?|errors?))\b")
 LIVE_STATUS = re.compile(r"(?<![\w.-])(?:[1-5]\d\d|healthy|success|passed|PASS)(?![\w-]|\.\w)")  # not inside an id
 ID_TOKEN = re.compile(r"(?<![\w.-])(?=[\w.-]*\d)[\w.-]{4,}(?![\w.-])")
 READ_BACK = re.compile(r"read[ -]?back|readback|\w\s*(?:==?|->|→)\s*\S", re.I)
@@ -259,7 +259,7 @@ class Ledger:
                     raise CloseRefused(reason)
             # After a crash between archive and removal, retry the same call must not append a second copy.
             old_rows = self.closed_rows()
-            old = next((r for r in old_rows if r["id"] == row_id and r.get("proof") == str(proof)), None)
+            old = next((r for r in old_rows if r["id"] == row_id and r.get("proof") == clean(str(proof))), None)
             if old is not None:
                 del lines[row["_line"] - 1]
                 atomic_write(self.path, "\n".join(lines) + "\n")
@@ -380,6 +380,12 @@ def not_proof(value: str) -> bool:
     return not re.search(r"\d", value or "") and all(w in NOT_PROOF_WORDS for w in words)
 
 
+
+def ref_without_zero_failures(value: str) -> str:
+    """Remove explicitly zero-failure runs before looking for red words, so `0 failures` is still green."""
+    return re.sub(r"(?i)(?<![a-z0-9_-])0\s+(?:failed|failures?|errors?)\b", " ", value)
+
+
 def proof_problem(kind: str, ref: str, text: str) -> str | None:
     """None when (kind, ref, text) is structured proof, else why not. Static, so check() can re-run it on the
     archive. The ref carries the checkable token; text says what it proves.
@@ -404,7 +410,7 @@ def proof_problem(kind: str, ref: str, text: str) -> str | None:
         return "the ref must not contain ' - ' (it separates ref from text in the archive)"
     if not_proof(ref) or not_proof(text):
         return f"{ref if not_proof(ref) else text!r} is a claim, not proof"
-    if FAILURE.search(f"{ref} {text}"):
+    if kind in {"tests", "ci", "deployed"} and (FAILURE.search(ref_without_zero_failures(f"{ref} {text}")) or FAILURE_COUNT.search(f"{ref} {text}")):
         return f"the proof reports a failure ({ref} {text}); a failed or cancelled check is not completed work"
     if kind == "tests" and not (COUNTS.search(ref) or RUN_ID.search(ref)):
         return "a tests proof needs the counts or a run id, not prose"

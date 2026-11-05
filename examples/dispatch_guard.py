@@ -218,7 +218,10 @@ def guard(key: str | None, row: str, session: str, sources: Sources, claims: Cla
                 if dispatch["session"] == session:
                     continue
                 when = datetime.fromisoformat(dispatch["at"])
-            except (KeyError, TypeError, ValueError) as error:
+                if when.tzinfo is None:
+                    raise ValueError("naive dispatch time")
+            except (KeyError, TypeError, ValueError, OverflowError) as error:
+                # treat the whole record (including the cutoff comparison) as unsafe, not just the parse.
                 v.warnings.append(f"malformed recent dispatch ({error}); continuing the lookup")
                 continue
             if when >= cutoff:
