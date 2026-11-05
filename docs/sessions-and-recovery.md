@@ -22,6 +22,7 @@ Sooner or later there is more than one coordinator session: a second terminal, a
 - **An expired lease is flagged, never taken over automatically.** Automatic takeover turns a slow primary into two primaries. Takeover is an explicit command with a reason, and it refuses a lease that is still held unless forced (`--force`, for a planned rollover). It records the previous holder, its host, its epoch and when it was last seen.
 - **Every takeover increments `epoch`.** The epoch is a fencing token: see below.
 - Everything that targets "the coordinator" (timers, gate messages, intake wakes) resolves the target from the lease at send time, not from a hard-coded id.
+- **A broken lease is not "no lease".** A file that does not parse, or parses with a bad field (no primary, a `renewed_at` without a time zone, a `ttl_s` or `epoch` that is not a positive whole number), raises a named error from every read, so fenced writes refuse. Scheduled jobs read that error as "not primary here": one log line and skip. Nothing repairs it automatically; fix the field by hand, keeping the epoch. A lease written before epochs existed is still valid.
 
 See [examples/lease.py](../examples/lease.py).
 

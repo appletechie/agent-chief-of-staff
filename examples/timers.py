@@ -24,6 +24,11 @@ The bounded window: a takeover that lands during a send cannot stop that one sen
 replaced tick records nothing and stops. The timer stays `sending`, and the new primary's next tick marks it failed
 ("not resent"), so it is surfaced, never sent twice.
 
+Bad records: a file that does not parse as an array stops the tick (TimersCorrupt, one log line, nothing sent).
+A record that parses but has a bad field (not an object, no id, an unknown state, or for an armed timer a missing
+send field, a due or first_attempt_at that is not an ISO 8601 time with a time zone) is skipped and logged on every
+tick while the rest still tick. It is left on disk as it is, for a person to repair.
+
 `send(target, text)` is injected: in production it queues a message into the coordinator's session,
 which is delivered when the session is next free (never "start a run", which a busy agent may reject).
 """
@@ -133,6 +138,44 @@ class TimersCorrupt(RuntimeError):
     """Timers exist but could not be parsed; deliver nothing but say so."""
 
 
+STATES = ("armed", "sending", "delivered", "failed", "cancelled")
+SEND_FIELDS = ("row", "name", "target", "prompt")
+
+
+def aware(value) -> datetime | None:
+    """The datetime of an ISO 8601 string that carries a time zone, else None. A naive time is ambiguous: invalid."""
+    if not isinstance(value, str):
+        return None
+    try:
+        when = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.utcoffset() is not None else None
+
+
+def timer_problem(t) -> str | None:
+    """Why the tick can't use this record, or None. Only what the tick reads is checked: an id and a state for every
+    record, and for an armed one the send fields, attempts, and a due (and any first_attempt_at) with a time zone."""
+    if not isinstance(t, dict):
+        return f"not an object ({type(t).__name__})"
+    if not isinstance(t.get("id"), str) or not t["id"].strip():
+        return "'id' is missing or not a string"
+    if t.get("state") not in STATES:
+        return f"'state' {str(t.get('state'))[:20]!r} is not one of {'/'.join(STATES)}"
+    if t["state"] != "armed":
+        return None
+    for name in SEND_FIELDS:
+        if not isinstance(t.get(name), str):
+            return f"{name!r} is missing or not a string"
+    attempts = t.get("attempts", 0)
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0:
+        return f"'attempts' {str(attempts)[:20]!r} is not a whole number"
+    for name in ("due", "first_attempt_at"):
+        if (name == "due" or name in t) and aware(t.get(name)) is None:
+            return f"{name!r} {str(t.get(name))[:40]!r} is not an ISO 8601 time with a time zone"
+    return None
+
+
 class Timers:
     def __init__(self, path: Path, fence: Callable[[], ContextManager[int]] | None = None):
         self.path = Path(path)
@@ -159,9 +202,9 @@ class Timers:
             timers = json.loads(self.path.read_text())
         except json.JSONDecodeError as error:
             raise TimersCorrupt(f"{self.path}: timers.json is corrupt (line {error.lineno} column {error.colno})") from error
-        if not isinstance(timers, list) or any(not isinstance(t, dict) or "id" not in t for t in timers):
+        if not isinstance(timers, list):
             raise TimersCorrupt(f"{self.path}: expected an array of timer objects")
-        return timers
+        return timers  # each record is checked by timer_problem() where it is used
 
     def save(self, timers: list[dict]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,7 +220,7 @@ class Timers:
         when, note = parse_due(due, now)
         with self._fenced(expect_epoch), file_lock(self.lock):
             timers = self.load()
-            taken = {t["id"] for t in timers}
+            taken = {t.get("id") for t in timers if isinstance(t, dict)}
             # token_hex collision is rare; a pasted, broken or exhausted RNG must not wedge the store with a
             # never-ending redraw while it holds lock.
             for _ in range(10):
@@ -216,14 +259,19 @@ class Timers:
 
     def _tick(self, send, open_rows: set[str], now: datetime, expect_epoch: int | None) -> list[str]:
         with self._fenced(expect_epoch):
-            timers, log = self.load(), []
-            for t in timers:
-                if t["state"] == "sending":
+            timers, log, invalid = self.load(), [], set()
+            for index, t in enumerate(timers):
+                problem = timer_problem(t)
+                if problem:
+                    invalid.add(index)
+                    ref = t["id"] if isinstance(t, dict) and isinstance(t.get("id"), str) else f"record {index}"
+                    log.append(f"{ref} invalid ({problem}); skipped, repair it in {self.path.name}")
+                elif t["state"] == "sending":
                     t["state"], t["note"] = "failed", "found in sending state; not resent"
                     log.append(f"{t['id']} failed (crashed mid-send)")
             self.save(timers)
-        for t in timers:
-            if t["state"] != "armed" or datetime.fromisoformat(t["due"]) > now:
+        for index, t in enumerate(timers):
+            if index in invalid or t["state"] != "armed" or aware(t["due"]) > now:
                 continue
             with self._fenced(expect_epoch):  # a takeover since the last send stops the tick here
                 if t["row"] not in open_rows:
@@ -241,8 +289,8 @@ class Timers:
                 receipt, error = None, caught
             with self._fenced(expect_epoch):  # taken over mid-send: record nothing, leave it `sending`
                 if error is not None:
-                    t["attempts"] += 1
-                    expired = now - datetime.fromisoformat(t["first_attempt_at"]) >= RETRY_WINDOW
+                    t["attempts"] = t.get("attempts", 0) + 1
+                    expired = now - aware(t["first_attempt_at"]) >= RETRY_WINDOW
                     t["state"] = "failed" if expired else "armed"
                     t["note"] = f"send error: {type(error).__name__}"
                     log.append(f"{t['id']} send error, attempt {t['attempts']}" + ("; retry window over" if expired else ""))

@@ -6,6 +6,10 @@ issue tracker or agent runner. A lookup that fails becomes a warning, never a si
 
 Claims are written under an exclusive lock, and claim() refuses a name another session holds, so two sessions
 that both passed guard() at the same moment cannot both claim the same row: the second claim raises ClaimHeld.
+
+A claim that parses but has a bad field (not an object, no session or worker, an `at` that is not an ISO 8601 time
+with a time zone) can't be aged out or attributed, so it never expires and never reads as free: guard() refuses that
+name and claim() treats it as held, until a person repairs or removes it.
 """
 from __future__ import annotations
 
@@ -37,6 +41,29 @@ class ClaimsCorrupt(RuntimeError):
 
 class ClaimHeld(RuntimeError):
     pass
+
+
+def aware(value) -> datetime | None:
+    """The datetime of an ISO 8601 string that carries a time zone, else None. A naive time is ambiguous: invalid."""
+    if not isinstance(value, str):
+        return None
+    try:
+        when = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.utcoffset() is not None else None
+
+
+def claim_problem(claim) -> str | None:
+    """Why a claim record can't be trusted, or None."""
+    if not isinstance(claim, dict):
+        return f"not an object ({type(claim).__name__})"
+    for name in ("session", "worker"):
+        if not isinstance(claim.get(name), str) or not claim[name].strip():
+            return f"{name!r} is missing or not a string"
+    if aware(claim.get("at")) is None:
+        return f"'at' {str(claim.get('at'))[:40]!r} is not an ISO 8601 time with a time zone"
+    return None
 
 
 @contextmanager
@@ -114,7 +141,8 @@ class Claims:
         return data
 
     def live(self, now: datetime) -> dict:
-        return {k: v for k, v in self.load().items() if now - datetime.fromisoformat(v["at"]) < CLAIM_TTL}
+        """Claims younger than CLAIM_TTL, plus every claim with a bad field (kept as is: it never expires)."""
+        return {k: v for k, v in self.load().items() if claim_problem(v) or now - aware(v["at"]) < CLAIM_TTL}
 
     def claim(self, names: Iterable[str], session: str, worker: str, now: datetime,
               override: str | None = None) -> None:
@@ -122,8 +150,9 @@ class Claims:
         names = list(names)
         with file_lock(self.lock):
             data = self.live(now)
-            taken = [f"{n} (session {data[n]['session']})" for n in names
-                     if n in data and data[n]["session"] != session]
+            taken = [f"{n} (invalid claim: {claim_problem(data[n])})" if claim_problem(data[n]) else
+                     f"{n} (session {data[n]['session']})" for n in names
+                     if n in data and (claim_problem(data[n]) or data[n]["session"] != session)]
             if taken and not (override and override.strip()):
                 raise ClaimHeld("already claimed: " + ", ".join(taken))
             for name in names:
@@ -184,8 +213,12 @@ def guard(key: str | None, row: str, session: str, sources: Sources, claims: Cla
     except ClaimsCorrupt as error:
         v.refusals.append(f"claims file unreadable, cannot rule out a competing claim: {error}")
     for name in filter(None, (row, key)):
-        held = live_claims.get(name)
-        if held and held["session"] != session:
+        if name not in live_claims:
+            continue
+        held, problem = live_claims[name], claim_problem(live_claims[name])
+        if problem:
+            v.refusals.append(f"{name} has an invalid claim ({problem}); repair or remove it in {claims.path.name}")
+        elif held["session"] != session:
             v.refusals.append(f"{name} claimed by session {held['session']} (worker {held['worker']}) at {held['at']}")
 
     if v.refusals and allow_duplicate:

@@ -28,6 +28,7 @@ A script, run at the start of every periodic wake, that:
 ### Rules
 
 - **An unreadable source counts as CHANGED** and keeps its previous snapshot. A broken collector must never look like a quiet system.
+- **So does a snapshot that parses but has a bad field**: not an object, parts that are not objects, a last-pass time that is not ISO 8601 with a time zone (a naive time is ambiguous, so it is invalid). The bad field is dropped and this pass saves a clean snapshot. Parsing the JSON is not enough; check each field before you compare with it.
 - **Force a pass after a maximum quiet period** (for example 4 hours), so nothing outside the hashed sources goes unchecked forever. A saved last-pass time in the future (clock skew, restored or copied state) also forces a pass, and the saved time is clamped to now; otherwise every gap looks short.
 - **Only the lease holder saves the shared snapshot.** A companion either runs with `--no-save` or keeps its own snapshot file. Otherwise a companion's look would "consume" a change and the primary would never act on it. The save carries the caller's lease epoch and is refused when the lease has moved on (see [sessions-and-recovery.md](sessions-and-recovery.md#fencing)).
 - **A dropped wake never runs the gate**, so its changes simply show up on the next one. That is the property that makes the gate safe against missed heartbeats.
@@ -67,6 +68,7 @@ A tick script runs every minute from the OS scheduler and delivers due timers.
 - **Check the owner when a timer fires.** If the worker it was about is closed or archived, read its last report and update the row; re-dispatch only if work remains.
 - **Optional busy deferral.** If delivering into a busy session would interrupt the owner's live conversation, defer for a bounded time (say up to 30 min), then deliver anyway.
 - **Lenient parsing.** An unreadable due time never fails the command; it defaults to a safe value (+60 min) and says so.
+- **One bad record never stops the tick.** A stored record with a bad field (no id, an unknown state, a due or first-attempt time without a time zone, a missing send field) is skipped and logged on every tick, left on disk for a person to repair, and the other timers still tick. Only a file that does not parse at all stops the tick, with one line and nothing sent.
 
 See [examples/timers.py](../examples/timers.py).
 
