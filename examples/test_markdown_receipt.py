@@ -8,8 +8,9 @@ T0 = datetime(2026, 1, 16, 14, 0, tzinfo=timezone.utc)
 K = "b73a1636b1f7e591a7e3a731e2f9e521bb1bfbd6"
 
 
-def decide(body="verdict: clean", title="fix", pr_body="", sha=K, now=T0):
-    pr = mg.PR("org/app", 1, title, pr_body, K, False, True, {"ci": "success"}, [mg.Review(sha, body)], 0, T0)
+def decide(body="verdict: clean", title="fix", pr_body="", sha=K, now=T0, at=None, extra=()):
+    reviews = [*extra, mg.Review(sha, body, at)]
+    pr = mg.PR("org/app", 1, title, pr_body, K, False, True, {"ci": "success"}, reviews, 0, T0)
     return mg.decide(pr, "", mg.Policy(frozenset()), now).action
 
 
@@ -43,16 +44,43 @@ class ReceiptMarkdown(unittest.TestCase):
 
 
 class ShortHeadSha(unittest.TestCase):
-    def test_an_abbreviation_of_the_head_counts(self):
-        for sha in (K[:7], K[:10], K[:10].upper()):
-            with self.subTest(sha=sha):
-                self.assertEqual(decide(sha=sha), "MERGE")
+    """A short receipt SHA binds only when it is 10+ hex, a prefix of the head, posted at or after the last push,
+    and not also a prefix of a full SHA another receipt names. A 7-hex prefix (~28 bits) can be crafted."""
+    LATER = T0 + timedelta(hours=2)
+    AFTER_PUSH = T0 + timedelta(minutes=5)
 
-    def test_another_commit_or_a_too_short_prefix_never_counts(self):
-        later = T0 + timedelta(hours=2)
-        for sha in ("0ld5ha0", K[:6], "b73a163z", ""):
+    def test_a_full_sha_receipt_binds(self):
+        self.assertEqual(decide(sha=K), "MERGE")
+        self.assertEqual(decide(sha=K.upper()), "MERGE")
+
+    def test_a_10_hex_abbreviation_posted_after_the_push_binds(self):
+        for sha in (K[:10], K[:12].upper()):
             with self.subTest(sha=sha):
-                self.assertEqual(decide(sha=sha, now=later), "REQUEST_REVIEW")
+                self.assertEqual(decide(sha=sha, at=self.AFTER_PUSH), "MERGE")
+
+    def test_a_crafted_shared_7_hex_prefix_is_refused(self):
+        for sha in (K[:7], K[:9]):
+            with self.subTest(sha=sha):
+                self.assertEqual(decide(sha=sha, at=self.AFTER_PUSH, now=self.LATER), "REQUEST_REVIEW")
+
+    def test_a_short_receipt_older_than_the_last_push_or_undated_is_refused(self):
+        for at in (T0 - timedelta(minutes=1), None):
+            with self.subTest(at=at):
+                self.assertEqual(decide(sha=K[:10], at=at, now=self.LATER), "REQUEST_REVIEW")
+
+    def test_a_short_receipt_never_stands_in_for_a_full_receipt_of_another_commit(self):
+        other = K[:10] + "f" * 30
+        findings = mg.Review(other, "verdict: findings", self.AFTER_PUSH)
+        self.assertEqual(decide(sha=K[:10], at=self.AFTER_PUSH, now=self.LATER, extra=[findings]), "REQUEST_REVIEW")
+
+    def test_a_full_head_receipt_outranks_a_short_one(self):
+        full = mg.Review(K, "verdict: findings", self.AFTER_PUSH)
+        self.assertEqual(decide(sha=K[:10], at=self.AFTER_PUSH, extra=[full]), "REPORT")
+
+    def test_another_commit_or_a_non_hex_prefix_never_counts(self):
+        for sha in ("0ld5ha0", "0ld5ha0b1c", "b73a163z", ""):
+            with self.subTest(sha=sha):
+                self.assertEqual(decide(sha=sha, at=self.AFTER_PUSH, now=self.LATER), "REQUEST_REVIEW")
 
 
 class FormattedHolds(unittest.TestCase):

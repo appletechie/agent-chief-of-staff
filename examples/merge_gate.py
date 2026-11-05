@@ -31,13 +31,15 @@ EMPTY_FINDINGS = re.compile(r"(?m)^[#\s*]*findings?\s*(?::\s*|\n\s*)(?:none|noth
 # "If Codex has suggestions, it will comment".
 # Only the "if ... has suggestions" clause goes: the rest of the sentence still counts.
 CONDITIONAL = re.compile(r"\bif\b[^.,;\n]{0,60}?\b(?:has|have|finds?)\s+(?:any\s+)?(?:suggestions?|issues?|findings?)\b")
-SHORT_SHA = re.compile(r"[0-9a-f]{7,40}")
+SHORT_SHA = re.compile(r"[0-9a-f]{10,39}")
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
 
 
 @dataclass
 class Review:
     sha: str
     body: str
+    at: datetime | None = None      # when the receipt was posted; a short sha binds only with it (see _receipts)
 
 
 @dataclass
@@ -105,16 +107,31 @@ def _verdict_lines(body: str) -> list[str]:
     return [m.group(1) for line in _outside_fences(body) if not INDENTED.match(line) and (m := VERDICT_LINE.match(line))]
 
 
-def _is_head(sha: str, head: str) -> bool:
-    """The receipt names the head: the full SHA, or an abbreviation of it (7+ hex characters) as bots write it (#28).
-    An abbreviation of any other commit does not match."""
-    sha, head = (sha or "").strip().lower(), (head or "").lower()
-    return bool(sha) and (sha == head or (SHORT_SHA.fullmatch(sha) is not None and head.startswith(sha)))
+def _receipts(pr: PR) -> list[Review]:
+    """The receipts that name the head. A full 40-hex SHA always binds. A 7-hex prefix is ~28 bits, so whoever can
+    push can craft a commit that shares it: an abbreviation (as bots write it, #28) binds only when it is 10+ hex,
+    a prefix of the head, posted at or after the last push, and not also a prefix of a full SHA another receipt
+    names. With any full-SHA receipt for the head, only those count."""
+    head = (pr.head_sha or "").lower()
+    full = [r for r in pr.reviews if (r.sha or "").strip().lower() == head and FULL_SHA.fullmatch(head)]
+    if full:
+        return full
+    others = {(r.sha or "").strip().lower() for r in pr.reviews} - {head}
+    others = {o for o in others if FULL_SHA.fullmatch(o)}
+    out = []
+    for r in pr.reviews:
+        sha = (r.sha or "").strip().lower()
+        if sha == head:
+            out.append(r)
+        elif (SHORT_SHA.fullmatch(sha) and head.startswith(sha) and r.at is not None and r.at >= pr.last_push_at
+              and not any(o.startswith(sha) for o in others)):
+            out.append(r)
+    return out
 
 
 def review_verdict(pr: PR, policy: Policy) -> str | None:
     """'clean', 'findings', 'unparsed', or None when no receipt names the head SHA."""
-    receipts = [r for r in pr.reviews if _is_head(r.sha, pr.head_sha)]
+    receipts = _receipts(pr)
     if not receipts:
         return None
     body = receipts[-1].body.lower()
