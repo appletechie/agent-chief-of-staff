@@ -119,3 +119,6 @@ Nothing generated is hand-edited. If a view is wrong, fix the source or the gene
 ## History lives elsewhere
 
 The ledger is an index, not a journal. Put the story of an item in tracker comments (proof, caveats, what was tried) or in its notes file. A tracker issue moves to done only with its caveats written on the issue.
+
+
+Archive and proof note updates are full-file atomic replacements under the ledger lock, not appends with a torn-write hazard. A partly-written leading row is rejected for repair rather than silently deriving the highest id from an invisible record.
