@@ -64,24 +64,42 @@ class Decision:
     reason: str
 
 
+def _verdict_lines(body: str) -> list[str]:
+    """Token values on verdict lines **outside** fenced blocks, in file order.
+
+    Bots write examples of the same format (or instructions saying to use it) in the same receipt, so a
+    bare search would treat an illustrating code block as the verdict. Fenced regions are not instructions to
+    the gate.
+    """
+    out, fence = [], False
+    for line in body.splitlines():
+        if line.lstrip().startswith("```"):
+            fence = not fence
+            continue
+        if not fence and (m := VERDICT_LINE.match(line)):
+            out.append(m.group(1))
+    return out
+
+
 def review_verdict(pr: PR, policy: Policy) -> str | None:
     """'clean', 'findings', 'unparsed', or None when no receipt names the head SHA."""
     receipts = [r for r in pr.reviews if r.sha == pr.head_sha]
     if not receipts:
         return None
     body = receipts[-1].body.lower()
-    # Preferred: an explicit verdict on a line of its own, e.g. "verdict: clean" or "verdict: findings".
-    token = VERDICT_LINE.search(body)
-    if token:
-        return token.group(1)
-    # Fallback: phrase matching. Remove the clean phrases first, because they can contain finding words
-    # ("no major issues" contains "issue"); a receipt with any finding word left over is not clean.
+    # Explicit verdict wins over phrases, but the last one rather than the first: a receipt that repeats its
+    # convention before the actual decision should not be judged by the example.
+    tokens = _verdict_lines(body)
     clean = any(p in body for p in policy.clean_phrases)
     residue = body
     for phrase in policy.clean_phrases:
         residue = residue.replace(phrase, " ")
+    # Findings anywhere in the receipt beat a clean verdict token: the token is a summary, the list is the
+    # evidence that something is left.
     if any(p in residue for p in policy.finding_phrases):
         return "findings"
+    if tokens:
+        return tokens[-1]
     return "clean" if clean else "unparsed"
 
 
