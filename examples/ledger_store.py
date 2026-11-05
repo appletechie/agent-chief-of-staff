@@ -55,7 +55,7 @@ RUN_ID = re.compile(r"\b\d{6,}\b")
 COUNTS = re.compile(r"\bRan \d+\b|\b\d+\s*(?:tests?|passed|passing|failed|failures|errors|skipped)\b|\b\d+\s*/\s*\d+\b"
                     r"|\b\d+ OK\b|\bOK \(", re.I)
 CI_SUCCESS = re.compile(r"\bsuccess\b", re.I)
-LIVE_STATUS = re.compile(r"\b(?:[1-5]\d\d|healthy|success|passed|PASS)\b")
+LIVE_STATUS = re.compile(r"(?<![\w.-])(?:[1-5]\d\d|healthy|success|passed|PASS)(?![\w-]|\.\w)")  # not inside an id
 ID_TOKEN = re.compile(r"(?<![\w.-])(?=[\w.-]*\d)[\w.-]{4,}(?![\w.-])")
 READ_BACK = re.compile(r"read[ -]?back|readback|\w\s*(?:==?|->|→)\s*\S", re.I)
 MESSAGE_ID = re.compile(r"\d{4,}")
@@ -274,7 +274,9 @@ class Ledger:
         if into is None:
             return f"folded target {target} is not another open row"
         note = self.notes / f"{target}.md"
-        if not any(row_id in str(into[k]) for k in FIELDS) and not (note.exists() and row_id in note.read_text()):
+        named = re.compile(rf"(?<![\w-]){re.escape(row_id)}(?!\w)")
+        if not any(named.search(str(into[k])) for k in FIELDS if k != "id") and not (
+                note.exists() and named.search(note.read_text())):
             return f"folded target {target} does not mention {row_id}; carry its open items there first"
         return None
 
@@ -395,8 +397,7 @@ def proof_problem(kind: str, ref: str, text: str) -> str | None:
     if kind == "merged" and not re.fullmatch(r"[0-9a-f]{7,40}", ref):
         return "a merged proof is the merge commit SHA"
     if kind == "deployed":
-        status = LIVE_STATUS.search(ref)
-        if not status or not ID_TOKEN.search(ref[:status.start()] + " " + ref[status.end():]):
+        if not any(ID_TOKEN.search(ref[:m.start()] + " " + ref[m.end():]) for m in LIVE_STATUS.finditer(ref)):
             return "a deployed proof needs a deploy or run id plus a live check status"
     if kind == "config" and not READ_BACK.search(ref):
         return "a config proof needs the setting read back (name=value)"

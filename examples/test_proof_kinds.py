@@ -73,6 +73,14 @@ class RefusedProof(ProofKindsBase):
         self.assertIsNotNone(ls.proof_problem("owner", '"ship it" 2026-01-16', "owner decided"))
         self.assertIsNotNone(ls.proof_problem("owner", "ship it 14:02Z", "owner decided"))
 
+    def test_status_inside_a_deploy_id_is_not_the_live_check(self):
+        for ref in ("deploy dep-200, readyz 200", "deploy dep-404 healthy.", "run 4198283941: /readyz 200"):
+            with self.subTest(ref=ref):
+                self.assertIsNone(ls.proof_problem("deployed", ref, "flow re-run"))
+        for ref in ("deploy dep-200", "dep-200 rolled", "readyz 200"):
+            with self.subTest(ref=ref):
+                self.assertIsNotNone(ls.proof_problem("deployed", ref, "flow re-run"))
+
     def test_ref_must_not_hold_the_separator(self):
         self.assertIsNotNone(ls.proof_problem("owner", '"close it - now" 14:02Z', "owner decided"))
 
@@ -102,6 +110,20 @@ class AcceptedProof(ProofKindsBase):
 
 
 class Folded(ProofKindsBase):
+    def test_a_longer_id_is_not_a_mention(self):
+        led = ls.Ledger(self.root)
+        led.path.write_text("| id | key | owner | next action | waits on | due |\n|---|---|---|---|---|---|\n"
+                            "| R-100 | — | coordinator | Probe | — | — |\n"
+                            "| R-1000 | — | coordinator | Unrelated; see R-1001 | — | — |\n"
+                            "| R-1002 | — | coordinator | Carries R-100x and R-1000 | — | — |\n")
+        before = led.path.read_text()
+        for target in ("R-1000", "R-1002"):
+            with self.subTest(target=target), self.assertRaises(ls.CloseRefused):
+                led.close_row("R-100", "folded", target, "same work")
+        self.untouched(led, before)
+        led.write_row("R-1002", next="Carries R-100's follow-ups")
+        led.close_row("R-100", "folded", "R-1002", "same work")
+
     def test_target_must_be_open_and_mention_the_row(self):
         led = self.ledger()
         before = led.path.read_text()
