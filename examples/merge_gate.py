@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 GREEN = {"success", "skipped", "neutral"}
+# A required check must actually run and pass; skipped is green only for checks a repo doesn't require.
+REQUIRED_GREEN = {"success"}
+VERDICT_LINE = re.compile(r"(?m)^\s*verdict:\s*(clean|findings)\s*$")
 PENDING = {"queued", "in_progress", "pending", "waiting", "requested"}
 # Row holds are the owner's words: an uppercase token or a fixed phrase, not any prose containing "held".
 ROW_HOLD = re.compile(r"\bHOLD\b|\bHELD\b|(?i:\bon hold\b|\bdo not merge\b|\bdon'?t merge\b)")
@@ -45,6 +48,9 @@ class Policy:
     deploys_on_merge: frozenset[str]
     clean_phrases: tuple[str, ...] = ("no major issues", "looks good to merge")
     finding_phrases: tuple[str, ...] = ("issue", "finding", "suggest", "bug", "p1", "p2")
+    # Checks each repo must report on the head SHA. A listed check that never reported means WAIT,
+    # and a listed check that was skipped is not green. Unlisted checks may be skipped (path filters).
+    required_checks: dict[str, frozenset[str]] = field(default_factory=dict)
     merge_drafts: bool = False
     review_wait: timedelta = timedelta(minutes=45)
 
@@ -61,11 +67,19 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
     if not receipts:
         return None
     body = receipts[-1].body.lower()
-    if any(p in body for p in policy.clean_phrases):
-        return "clean"
-    if any(p in body for p in policy.finding_phrases):
+    # Preferred: an explicit verdict on a line of its own, e.g. "verdict: clean" or "verdict: findings".
+    token = VERDICT_LINE.search(body)
+    if token:
+        return token.group(1)
+    # Fallback: phrase matching. Remove the clean phrases first, because they can contain finding words
+    # ("no major issues" contains "issue"); a receipt with any finding word left over is not clean.
+    clean = any(p in body for p in policy.clean_phrases)
+    residue = body
+    for phrase in policy.clean_phrases:
+        residue = residue.replace(phrase, " ")
+    if any(p in residue for p in policy.finding_phrases):
         return "findings"
-    return "unparsed"
+    return "clean" if clean else "unparsed"
 
 
 def decide(pr: PR, row_text: str, policy: Policy, now: datetime | None = None) -> Decision:
@@ -83,9 +97,14 @@ def decide(pr: PR, row_text: str, policy: Policy, now: datetime | None = None) -
     if not pr.checks:
         return Decision("WAIT", f"no checks reported on {pr.head_sha[:7]} yet")
     states = {name: s.lower() for name, s in pr.checks.items()}
+    required = policy.required_checks.get(pr.repo, frozenset())
+    missing = sorted(required - set(states))
+    if missing:
+        return Decision("WAIT", "required checks not yet reported: " + ", ".join(missing))
     if any(s in PENDING for s in states.values()):
         return Decision("WAIT", "checks pending on head")
-    red = sorted(n for n, s in states.items() if s not in GREEN)
+    red = sorted(n for n, s in states.items()
+                 if s not in GREEN or (n in required and s not in REQUIRED_GREEN))
     if red:
         return Decision("REPORT", "checks not green on head: " + ", ".join(red))
     verdict = review_verdict(pr, policy)

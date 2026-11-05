@@ -134,4 +134,4 @@ This is a design distilled from running a coordinator over dozens of concurrent 
 
 ## License
 
-MIT. See [LICENSE](LICENSE); fill in the copyright holder before publishing.
+MIT. See [LICENSE](LICENSE).

@@ -1,6 +1,8 @@
 """Tests for the example sketches. Run from this directory: python3 -m unittest -v test_examples"""
 import json
 import tempfile
+import subprocess
+import sys
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -56,6 +58,19 @@ class LedgerTests(TempDir):
         ids = [r["id"] for r in led.rows()]
         self.assertEqual(len(ids), 9)
         self.assertEqual(len(set(ids)), 9)
+
+    def test_concurrent_processes_do_not_lose_rows(self):
+        # Threads share one process; the lock must also hold across separate processes.
+        led = ls.Ledger(self.root)
+        led.write_row(None, next="seed")
+        here = str(Path(__file__).resolve().parent)
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); import ledger_store as ls\n"
+                "for j in range(5): ls.Ledger(sys.argv[2]).write_row(None, next=f'p{sys.argv[3]} w{j}')")
+        procs = [subprocess.Popen([sys.executable, "-c", code, here, str(self.root), str(i)]) for i in range(6)]
+        self.assertEqual([p.wait(timeout=60) for p in procs], [0] * 6)
+        ids = [r["id"] for r in led.rows()]
+        self.assertEqual((len(ids), len(set(ids))), (31, 31))
+        self.assertEqual(led.check()[0], [])
 
     def test_checker_flags_bad_rows(self):
         led = ls.Ledger(self.root)
@@ -121,6 +136,9 @@ class WakeGateTests(TempDir):
 class TimerTests(TempDir):
     def test_wait_line_parsing_is_lenient(self):
         self.assertEqual(tm.parse_wait("WAIT ci org/app#88 +45m", T0)["due"], T0 + timedelta(minutes=45))
+        # Issue #1, finding 4: with the ref omitted, the time is still the check-by.
+        no_ref = tm.parse_wait("WAIT ci +45m", T0)
+        self.assertEqual((no_ref["ref"], no_ref["due"], no_ref["note"]), ("", T0 + timedelta(minutes=45), None))
         loose = tm.parse_wait("WAIT", T0)
         self.assertEqual((loose["kind"], loose["due"]), ("other", T0 + timedelta(minutes=60)))
         self.assertIsNotNone(tm.parse_wait("WAIT deploy d-42 sometime soon", T0)["note"])
@@ -223,6 +241,24 @@ class MergeGateTests(unittest.TestCase):
         self.assertEqual(self.action(checks={"test": "in_progress"}), "WAIT")
         self.assertEqual(self.action(checks={"test": "cancelled"}), "REPORT")
         self.assertEqual(self.action(checks={}), "WAIT")
+
+    def test_clean_phrase_does_not_hide_findings(self):
+        # Issue #1, finding 1: a clean phrase and a P1 in the same receipt is not clean.
+        mixed = [mg.Review("abc1234", "Looks good to merge. One P1 bug in the retry loop.")]
+        self.assertEqual(self.action(reviews=mixed), "REPORT")
+        self.assertEqual(self.action(reviews=[mg.Review("abc1234", "No major issues.")]), "MERGE")
+
+    def test_explicit_verdict_line_wins(self):
+        self.assertEqual(self.action(reviews=[mg.Review("abc1234", "Notes on the loop.\nverdict: clean\n")]), "MERGE")
+        self.assertEqual(self.action(reviews=[mg.Review("abc1234", "No major issues.\nVerdict: findings")]), "REPORT")
+
+    def test_required_checks(self):
+        # Issue #1, findings 2 and 3: a required check must report and must pass; unlisted checks may skip.
+        policy = mg.Policy(deploys_on_merge=frozenset(), required_checks={"org/app": frozenset({"test", "e2e"})})
+        decide = lambda **kw: mg.decide(self.pr(**kw), "fix it", policy, now=T0 + timedelta(hours=1)).action
+        self.assertEqual(decide(checks={"test": "success"}), "WAIT")
+        self.assertEqual(decide(checks={"test": "success", "e2e": "skipped"}), "REPORT")
+        self.assertEqual(decide(checks={"test": "success", "e2e": "success", "lint": "skipped"}), "MERGE")
 
     def test_deploy_on_merge_repo_is_never_auto_merged(self):
         self.assertEqual(self.action(repo="org/site"), "REPORT")

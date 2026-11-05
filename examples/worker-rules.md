@@ -57,7 +57,9 @@ other session holds that stack. Never edit the ledger; the coordinator owns it.
 
 ### Proof
 "Done" is proven in this run: quote the exit code and summary count, the CI conclusion on the head SHA,
-the read-back after a write, or the live response. A cancelled, timed-out or skipped step is not green.
+the read-back after a write, or the live response. A cancelled, timed-out or failed step is not green,
+and a skipped step proves nothing ran. (The merge gate lets a skipped check through only when the repo
+doesn't require it; see docs/merge-gate.md.)
 If you could not check something, say it is unconfirmed.
 
 ### Report (last message, in this order)
