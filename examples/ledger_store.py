@@ -186,6 +186,10 @@ class Ledger:
             archive.parent.mkdir(parents=True, exist_ok=True)
             if not archive.exists():
                 archive.write_text("| id | key | closed | proof | last next action |\n|---|---|---|---|---|\n")
+            # store the proof's full text in the row's note before the archive (a table) cuts or rewrites it.
+            self.notes.mkdir(parents=True, exist_ok=True)
+            with (self.notes / f"{row_id}.md").open("a") as note:
+                note.write("\n## proof\n" + str(proof) + "\n")
             with archive.open("a") as fh:
                 fh.write(table_line([row_id, row["key"], f"{now:%Y-%m-%d %H:%MZ}", clean(proof), row["next"]]) + "\n")
             del lines[row["_line"] - 1]
