@@ -129,6 +129,10 @@ def parse_wait(line: str, now: datetime) -> dict | None:
     return {"kind": kind, "ref": ref, "due": due, "note": note}
 
 
+class TimersCorrupt(RuntimeError):
+    """Timers exist but could not be parsed; deliver nothing but say so."""
+
+
 class Timers:
     def __init__(self, path: Path, fence: Callable[[], ContextManager[int]] | None = None):
         self.path = Path(path)
@@ -149,7 +153,15 @@ class Timers:
             yield
 
     def load(self) -> list[dict]:
-        return json.loads(self.path.read_text()) if self.path.exists() else []
+        if not self.path.exists():
+            return []
+        try:
+            timers = json.loads(self.path.read_text())
+        except json.JSONDecodeError as error:
+            raise TimersCorrupt(f"{self.path}: timers.json is corrupt (line {error.lineno} column {error.colno})") from error
+        if not isinstance(timers, list) or any(not isinstance(t, dict) or "id" not in t for t in timers):
+            raise TimersCorrupt(f"{self.path}: expected an array of timer objects")
+        return timers
 
     def save(self, timers: list[dict]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -166,9 +178,14 @@ class Timers:
         with self._fenced(expect_epoch), file_lock(self.lock):
             timers = self.load()
             taken = {t["id"] for t in timers}
-            timer_id = "t-" + secrets.token_hex(3)
-            while timer_id in taken:
+            # token_hex collision is rare; a pasted, broken or exhausted RNG must not wedge the store with a
+            # never-ending redraw while it holds lock.
+            for _ in range(10):
                 timer_id = "t-" + secrets.token_hex(3)
+                if timer_id not in taken:
+                    break
+            else:
+                raise RuntimeError("could not draw a free timer id after 10 attempts; check the RNG")
             timer = {"id": timer_id, "row": row, "name": name, "due": when.isoformat(),
                      "target": target, "owner": owner, "prompt": prompt, "state": "armed",
                      "attempts": 0, "source": source, "note": note}
@@ -194,6 +211,8 @@ class Timers:
                 return self._tick(send, open_rows, now or datetime.now(timezone.utc), expect_epoch)
         except LockTimeout:
             return ["another tick is running; delivered nothing"]
+        except TimersCorrupt as error:
+            return [str(error)]
 
     def _tick(self, send, open_rows: set[str], now: datetime, expect_epoch: int | None) -> list[str]:
         with self._fenced(expect_epoch):
