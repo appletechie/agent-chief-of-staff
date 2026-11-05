@@ -28,6 +28,8 @@ Each of these happened at least once in a real fleet. They are written as genera
 - **A merge can deploy.** Check the repo's auto-deploy setting before "merge but don't deploy".
 - **CI on the previous commit means nothing.** Evaluate and merge against one head SHA with an expected-head guard.
 - **Review bots stall and change their output format.** Request once per SHA, wait generously, parse defensively, treat unknown as not clean.
+- **Phrase lists overlap.** "No major issues" contains "issue", so whichever list is checked first decides, and a receipt that says "looks good to merge" and names a P1 can read as clean. Prefer an explicit verdict line; when matching phrases, strip the clean phrases before looking for findings.
+- **A required check that never reported looks like no check at all.** The gate only sees the checks it is handed; list each repo's required checks and wait for all of them.
 - **Conditional holds stay held.** A script cannot evaluate "after the migration lands".
 - **Cancelled and timed-out are not green.** Neither is a watcher process exiting 0.
 

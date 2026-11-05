@@ -53,8 +53,12 @@ def parse_wait(line: str, now: datetime) -> dict | None:
     kind = (m.group("kind") or "other").lower()
     if kind not in KINDS:
         kind = "other"
-    due, note = parse_due(m.group("check_by"), now)
-    return {"kind": kind, "ref": m.group("ref") or "", "due": due, "note": note}
+    ref, when = m.group("ref") or "", m.group("check_by")
+    # "WAIT ci +45m": with the ref omitted, the time lands in the ref slot. If it parses as a time, it is one.
+    if when is None and ref and parse_due(ref, now)[1] is None:
+        ref, when = "", ref
+    due, note = parse_due(when, now)
+    return {"kind": kind, "ref": ref, "due": due, "note": note}
 
 
 class Timers:
