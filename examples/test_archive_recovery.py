@@ -112,7 +112,7 @@ class TornArchive(Base):
     def test_spliced_rows_and_an_id_cell_after_text_are_reported(self):
         self.archive().parent.mkdir(parents=True)
         cases = {
-            ROW.rstrip("\n") + ROW: "2 rows spliced",
+            ROW.rstrip("\n") + ROW: "rows spliced",
             "|| R-001 | — | 2026-01-16 14:00Z | tests: Ran 12 tests OK - on head abc1234 | x |\n": "after other text",
             "x | R-001 | — | 2026-01-16 14:00Z | tests: Ran 12 tests OK - on head abc1234 | x |\n": "after other text",
             "| R-001 | — |\n": "2 cells",
@@ -125,6 +125,15 @@ class TornArchive(Base):
                 self.assertIn(problem, found[0]["problem"])
                 self.assertEqual(found[0]["ids"], ["R-001"])
                 self.assertEqual(self.ledger.next_free_id(), "R-002")
+
+    def test_a_next_action_that_is_only_a_row_id_is_not_a_second_row(self):
+        # Codex on #30: a cell holding just "R-002" is a value, not a row boundary.
+        self.ledger.write_row(None, next="R-002")
+        self.close()
+        self.assertEqual(self.ledger.archive_problems(), [])
+        self.ledger.write_row(None, next="close this too")
+        self.ledger.close_row("R-002", "tests", "Ran 3 tests OK", "on head abc1234", now=T0)
+        self.assertEqual(sorted(self.ledger.closed_ids()), ["R-001", "R-002"])
 
     def test_whole_rows_stay_clean(self):
         self.archive().parent.mkdir(parents=True)

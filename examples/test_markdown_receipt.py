@@ -41,6 +41,10 @@ class ReceiptMarkdown(unittest.TestCase):
         boiler = "No major issues found.\n\nIf the bot has suggestions, it will comment; otherwise it reacts with a thumbs up."
         self.assertEqual(decide(boiler), "MERGE")
         self.assertEqual(decide("verdict: clean\nIf this has issues, fix the bug in parse() first."), "REPORT")
+        # Codex on #30: a conditional about the code, not the bot, is a finding.
+        self.assertEqual(decide("No major issues found.\n\nIf the connection has issues, reconnect() never resets "
+                                "the retry counter."), "REPORT")
+        self.assertEqual(decide("No major issues found.\n\nIf Codex has suggestions, it will comment."), "MERGE")
 
 
 class ShortHeadSha(unittest.TestCase):

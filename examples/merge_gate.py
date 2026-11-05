@@ -27,10 +27,11 @@ MD_MARKS = re.compile(r"[*_`~]+")
 INDENTED = re.compile(r"^(?: {4,}|\t)")
 # "Findings: None" (or a Findings heading over "None") says the list is empty (#28).
 EMPTY_FINDINGS = re.compile(r"(?m)^[#\s*]*findings?\s*(?::\s*|\n\s*)(?:none|nothing|n/a)\.?\s*$")
-# A conditional sentence about what a bot does with findings is boilerplate, not a finding (#28):
-# "If Codex has suggestions, it will comment".
-# Only the "if ... has suggestions" clause goes: the rest of the sentence still counts.
-CONDITIONAL = re.compile(r"\bif\b[^.,;\n]{0,60}?\b(?:has|have|finds?)\s+(?:any\s+)?(?:suggestions?|issues?|findings?)\b")
+# A conditional clause about what the review bot does with findings is boilerplate, not a finding (#28):
+# "If Codex has suggestions, it will comment". The subject must be the bot: "if the connection has issues, ..."
+# is a finding and stays (Codex on #30). Only the clause goes; the rest of the sentence still counts.
+CONDITIONAL = re.compile(r"\bif\s+(?:the\s+)?(?:codex|copilot|review(?:er|ing)?(?:\s+bot)?|bot|[\w-]+(?:\[bot\]|-bot|bot))"
+                         r"\s+(?:has|have|finds?)\s+(?:any\s+)?(?:suggestions?|issues?|findings?)\b", re.I)
 SHORT_SHA = re.compile(r"[0-9a-f]{10,39}")
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 

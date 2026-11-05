@@ -77,7 +77,8 @@ FALSE_FLAG = re.compile(r"(?<![\w-])(?:success(?:ful)?|succeeded|passed|pass|ok|
 OUTCOME_FIELD = re.compile(r"(?<![\w-])(?:conclusion|outcome|result|status|state|health)\s*[:=]\s*([A-Za-z][\w-]*)", re.I)
 GREEN_VALUES = {"success", "successful", "succeeded", "passed", "pass", "green", "ok", "healthy", "ready", "completed",
                 "complete", "live", "up", "running", "active", "merged", "deployed", "done"}
-NAMED_STATUS = re.compile(r"(?<![\w-])[\w./-]*?(?:readyz|healthz|livez|health|ready|status|http)[\w./-]*\s*[:=]\s*"
+# The key is one word (readyz, health_status), never part of a host or path: status.example.com:443 is a port.
+NAMED_STATUS = re.compile(r"(?<![\w./:-])[\w-]*?(?:readyz|healthz|livez|health|ready|status|http)[\w-]*\s*[:=]\s*"
                           r"([1-5]\d\d)(?!\d)", re.I)
 BARE_RATIO = re.compile(r"(?<![\w.:/#-])(\d+)\s*/\s*(\d+)(?![\w.:/-])")
 RAN_TOTAL = re.compile(r"\bRan (\d+) tests?\b", re.I)
@@ -247,8 +248,10 @@ class Ledger:
                     continue
                 elif not split(line) or not ROW_ID.match(split(line)[0]):
                     problem = "a row id cell after other text (torn or spliced row)"
-                elif len(cells) > 1:
-                    problem = f"{len(cells)} rows spliced onto one line"
+                elif len(split(line)) > 5 or re.search(r"\|\s*\|\s*R-\d{3,}\s*\|", line):
+                    # a row has 5 cells and clean() turns a "|" in a value into "/", so more cells is a second row;
+                    # a cell that only holds a row id (next action "R-002") is not one (Codex on #30)
+                    problem = "rows spliced onto one line"
                 elif len(split(line)) < 4:
                     problem = f"{len(split(line))} cells; an archived row has id, key, closed and proof"
                 else:

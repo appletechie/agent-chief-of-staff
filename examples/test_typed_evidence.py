@@ -19,6 +19,7 @@ RED = [
     ("deployed", "deploy-12345 healthy=false"),
     ("deployed", "deploy-12345 readyz:503"),
     ("deployed", "deploy-12345 healthz=500 healthy"),
+    ("deployed", "deploy-12345 health_status=503 healthy"),
     ("tests", "run 123456 exit_code=1"),
     ("tests", "run 123456 exit-status: 2"),
     ("tests", "63 / 64"),
@@ -42,6 +43,8 @@ GREEN = [
     ("deployed", "deploy-12345 readyz 200"),
     ("deployed", "deploy-12345 readyz:200 healthy=true"),
     ("deployed", "deploy 41982839415 https://example.com:443/health 200"),
+    ("deployed", "deploy-12345 https://status.example.com:443/health 200"),  # a port in a status host (Codex on #30)
+    ("deployed", "deploy-12345 ready.example.com:8443/readyz 200"),
 ]
 
 
