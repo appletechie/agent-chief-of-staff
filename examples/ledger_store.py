@@ -68,7 +68,20 @@ RED_COUNT = re.compile(r"(?<![\w.])[1-9]\d*\s*(?:failed|failures?|errors?)(?![\w
                        r"|(?<![\w-])(?:failed|failures?|errors?)\s*[=:]\s*[1-9]|\bFAILED\b")
 NOTHING_RAN = re.compile(r"\bRan 0 tests?\b|(?<![\w.])0\s*(?:tests?|passed)\b", re.I)
 SOME_RAN = re.compile(r"\bRan [1-9]|(?<![\w.])[1-9]\d*\s*(?:tests?|passed|passing)\b|\bOK\b|(?<![\w.])(\d+)\s*/\s*\1\b", re.I)
-EXIT_CODE = re.compile(r"\bexit(?:\s+code)?\s*[:=]?\s*(-?\d+)", re.I)
+EXIT_CODE = re.compile(r"(?<![\w-])exit(?:[ _-]?(?:code|status))?\s*[:=]?\s*(-?\d+)", re.I)
+# Typed fields (#25): an explicit count, flag or outcome field in the ref outranks a green word beside it.
+RED_FIELD_COUNT = re.compile(r"(?<![\w-])(?:fail(?:ed|ures?|ing)?|errors?)[ _-](?:count|total|num|tests?|checks?|jobs?)"
+                             r"\s*[:=]\s*0*([1-9]\d*)(?!\d)", re.I)
+FALSE_FLAG = re.compile(r"(?<![\w-])(?:success(?:ful)?|succeeded|passed|pass|ok|green|healthy|ready|live)\s*[:=]\s*"
+                        r"(?:false|no|off|none|null|0|f|n)(?![\w-])", re.I)
+OUTCOME_FIELD = re.compile(r"(?<![\w-])(?:conclusion|outcome|result|status|state|health)\s*[:=]\s*([A-Za-z][\w-]*)", re.I)
+GREEN_VALUES = {"success", "successful", "succeeded", "passed", "pass", "green", "ok", "healthy", "ready", "completed",
+                "complete", "live", "up", "running", "active", "merged", "deployed", "done"}
+NAMED_STATUS = re.compile(r"(?<![\w-])[\w./-]*?(?:readyz|healthz|livez|health|ready|status|http)[\w./-]*\s*[:=]\s*"
+                          r"([1-5]\d\d)(?!\d)", re.I)
+BARE_RATIO = re.compile(r"(?<![\w.:/#-])(\d+)\s*/\s*(\d+)(?![\w.:/-])")
+RAN_TOTAL = re.compile(r"\bRan (\d+) tests?\b", re.I)
+SKIPPED_COUNT = re.compile(r"\bskipped\s*[=:]\s*(\d+)|(?<![\w.])(\d+)\s+skipped\b", re.I)
 # a 3-digit live status, not a port (:443), part of a path or id, or a measurement (500 ms, 404 KB)
 HTTP_STATUS = re.compile(r"(?<![\w.:/-])([1-5]\d\d)(?![\w./:-]|\s*(?:ms|s|sec|secs|seconds|[kmg]i?b|bytes|%)(?![A-Za-z]))", re.I)
 PASS_RATIO = re.compile(r"(?<![\w.])(\d+)\s*/\s*(\d+)\s*(?:tests?|passed|passing|ok|green)\b", re.I)
@@ -81,6 +94,8 @@ WHEN = re.compile(r"\b\d{1,2}:\d\d(?!\d)")  # a time of day, not a bare date
 VOID_REASON = re.compile(r"\b(?:tests?|testing|fixture|accident\w*|mistake\w*|in error|by error|typo|stray|created by)\b",
                          re.I)
 PROOF_CELL = re.compile(r"^(?P<kind>[a-z]+): (?P<ref>.+?) - (?P<text>.+)$")
+ROW_ID_CELL = re.compile(r"\|\s*(R-\d{3,})\s*\|")
+LEADING_ID = re.compile(r"^\s*\|*\s*(R-\d{3,})\b")
 PR_REF = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w-]*/[\w.-]+)#(\d+)\b|github\.com/([\w-]+/[\w.-]+)/pull/(\d+)", re.I)
 
 _local = threading.local()  # re-entrancy is per thread; other threads must really wait
@@ -96,6 +111,11 @@ class ProofRefused(ValueError):
 
 class CloseRefused(ValueError):
     """The supplied close policy rejected this row/proof pair (PR not merged, review still open, ...)."""
+
+
+class ArchiveError(CloseRefused):
+    """An archive line is not one whole row (cut short by a crash, two rows spliced, an id cell after other text), so
+    nobody can tell what it records: every close refuses until a person repairs it, and check() reports it (#25)."""
 
 
 @dataclass(frozen=True)
@@ -211,8 +231,33 @@ class Ledger:
     def closed_ids(self) -> set[str]:
         return {r["id"] for r in self.closed_rows()}
 
+    def archive_problems(self) -> list[dict]:
+        """[{file, line, ids, problem}] for archive lines that closed_rows() cannot read as one whole row (#25): a
+        table line cut short (an append torn by a crash), two rows spliced onto one line, or a row id cell after
+        other text. Their ids (when any survive) still count as used, so next_free_id() never hands them out."""
+        out = []
+        for archive in sorted((self.root / "ledger").glob("closed-*.md")):
+            for n, line in enumerate(archive.read_text().splitlines(), 1):
+                body = line.strip()
+                cells = ROW_ID_CELL.findall(line)
+                ids = list(dict.fromkeys(cells + LEADING_ID.findall(line)))
+                if body.startswith("|") and (not body.endswith("|") or len(split(line)) < 2):
+                    problem = "cut short (no closing pipe, or no cells)"
+                elif not ids:
+                    continue
+                elif not split(line) or not ROW_ID.match(split(line)[0]):
+                    problem = "a row id cell after other text (torn or spliced row)"
+                elif len(cells) > 1:
+                    problem = f"{len(cells)} rows spliced onto one line"
+                elif len(split(line)) < 4:
+                    problem = f"{len(split(line))} cells; an archived row has id, key, closed and proof"
+                else:
+                    continue
+                out.append({"file": archive.name, "line": n, "ids": ids, "problem": problem})
+        return out
+
     def next_free_id(self) -> str:
-        used = {r["id"] for r in self.rows()} | self.closed_ids()
+        used = {r["id"] for r in self.rows()} | self.closed_ids() | {i for p in self.archive_problems() for i in p["ids"]}
         top = max((int(ROW_ID.match(i).group(1)) for i in used), default=0)
         return f"R-{top + 1:03d}"
 
@@ -247,10 +292,12 @@ class Ledger:
         """Move a row to ledger/closed-YYYY-MM.md with structured proof (see PROOF_KINDS and proof_problem).
 
         Refused before anything is written: a proof that is not evidence (ProofRefused), a folded target that is not
-        an open row mentioning this one, or a can_close policy that says no (CloseRefused). The full proof goes to
-        the row's note verbatim, the archive line is written next, then the ledger line is removed. A crash between
-        the two leaves the id in both places, which check() reports; finish by re-running the same close_row call: it
-        finds its own archived row (same id, kind and ref), appends nothing and removes the ledger line. An id already
+        an open row mentioning this one, a can_close policy that says no (CloseRefused), or an archive line that is
+        not one whole row (ArchiveError, #25). The full proof goes to the row's note verbatim, the archive row is
+        written next, then the ledger line is removed. Each of the three is a whole-file atomic replace, so a crash
+        leaves every file old or new, never a torn tail. A crash between two of them leaves the id in both the ledger
+        and the archive, which check() reports; finish by re-running the same close_row call: it finds its own
+        archived row (same id, kind and ref), writes nothing again and removes the ledger line. An id already
         archived with other proof is refused (ids are never reused)."""
         proof = Proof(kind, " ".join(str(ref or "").split()), " ".join(str(text or "").split()))
         problem = proof_problem(proof.kind, proof.ref, proof.text)
@@ -264,6 +311,13 @@ class Ledger:
             if not match:
                 raise KeyError(f"{row_id} is not open")
             row = match[0]
+            torn = self.archive_problems()
+            if torn:
+                first = torn[0]
+                raise ArchiveError(f"{row_id} not closed: ledger/{first['file']} line {first['line']} "
+                                   f"({', '.join(first['ids']) or 'no id left'}) is {first['problem']}"
+                                   + (f" (+{len(torn) - 1} more)" if len(torn) > 1 else "")
+                                   + "; repair the archive by hand first (check() lists every line)")
             if kind == "folded":
                 reason = self._fold_problem(row_id, proof.ref, rows)
                 if reason:
@@ -280,21 +334,19 @@ class Ledger:
                 raise CloseRefused(f"{row_id} is already archived in {archived[0]['_file']} with other proof "
                                    f"({archived[0]['proof']}); ids are never reused")
             # store the proof's full text in the row's note before the archive (a table) cuts or rewrites it.
-            self.notes.mkdir(parents=True, exist_ok=True)
             # the note keeps the caller's ref and text verbatim (whitespace and line breaks included)
             note_path, entry = self.notes / f"{row_id}.md", f"## proof\nkind: {kind}\nref: {ref}\n{text}\n"
-            if not (note_path.exists() and entry in note_path.read_text()):
-                with note_path.open("a") as note:
-                    note.write("\n" + entry)
+            prior = note_path.read_text() if note_path.exists() else ""
+            if entry not in prior:
+                atomic_write(note_path, prior + "\n" + entry)
             if same is not None:
                 archive = self.root / "ledger" / same["_file"]
             else:
                 archive = self.root / "ledger" / f"closed-{now:%Y-%m}.md"
-                archive.parent.mkdir(parents=True, exist_ok=True)
-                if not archive.exists():
-                    archive.write_text("| id | key | closed | proof | last next action |\n|---|---|---|---|---|\n")
-                with archive.open("a") as fh:
-                    fh.write(table_line([row_id, row["key"], f"{now:%Y-%m-%d %H:%MZ}", clean(str(proof)), row["next"]]) + "\n")
+                old = (archive.read_text() if archive.exists()
+                       else "| id | key | closed | proof | last next action |\n|---|---|---|---|---|\n")
+                atomic_write(archive, old + ("" if old.endswith("\n") else "\n")
+                             + table_line([row_id, row["key"], f"{now:%Y-%m-%d %H:%MZ}", clean(str(proof)), row["next"]]) + "\n")
             del lines[row["_line"] - 1]
             atomic_write(self.path, "\n".join(lines) + "\n")
             return str(archive)
@@ -321,8 +373,8 @@ class Ledger:
         self.notes.mkdir(parents=True, exist_ok=True)
         note = self.notes / f"{row['id']}.md"
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%MZ")
-        with note.open("a") as fh:
-            fh.write(f"\n## {stamp}\nnext action: {row['next']}\nwaits on: {row['waits']}\n")
+        prior = note.read_text() if note.exists() else ""  # whole-file replace: a crash never leaves half an entry
+        atomic_write(note, prior + f"\n## {stamp}\nnext action: {row['next']}\nwaits on: {row['waits']}\n")
         row = dict(row)
         pointer = f" (detail: ledger/notes/{row['id']}.md)"
         for k in SPILL_ORDER:
@@ -365,6 +417,8 @@ class Ledger:
             if self.require_key and r["key"] in NONE and self.require_key(r):
                 warnings.append(f"{where}: no issue key, and policy requires one for this row")
         errors += self.closed_proof_errors()
+        errors += [f"ledger/{p['file']} line {p['line']}: {', '.join(p['ids']) or 'a row'} is {p['problem']}; repair it by hand"
+                   for p in self.archive_problems()]
         dup_errors, dup_warnings = self.duplicate_archive_ids()
         return errors + dup_errors, warnings + dup_warnings
 
@@ -473,28 +527,57 @@ def red_outcome(kind: str, ref: str, text: str) -> str | None:
     """Why a tests/ci/deployed proof reports a failed, cancelled, timed-out or empty run, or None (#22). The ref is
     the result, so any red word in it refuses, even beside "success": FAILED, a nonzero failure or error count,
     cancelled, timed out, "no success", a required check skipped, a nonzero exit, 63/64, nothing ran, a 4xx/5xx live
-    status, unhealthy. The text describes, so only a nonzero failure count or a FAILED summary in it refuses."""
+    status, unhealthy, and the typed fields of typed_red (#25). The text describes, so only a nonzero failure count
+    (failures=1, failure_count=1) or a FAILED summary in it refuses."""
     if kind not in ("tests", "ci", "deployed"):
         return None
     ref_red = RED_OUTCOME.search(ZERO_RED.sub(" ", PATH_LIKE.sub(" ", ref)))
     if ref_red:
         return f"the {kind} proof reports {ref_red.group(0)!r}; a failed, cancelled or timed-out run is not done work"
-    text_red = RED_COUNT.search(ZERO_RED.sub(" ", PATH_LIKE.sub(" ", text)))
+    text_red = RED_COUNT.search(ZERO_RED.sub(" ", PATH_LIKE.sub(" ", text))) or RED_FIELD_COUNT.search(text)
     if text_red:
         return f"the {kind} proof's text reports {text_red.group(0)!r}; a failed run is not done work"
+    typed = typed_red(PATH_LIKE.sub(" ", ref))
+    if typed:
+        return f"the {kind} proof reports {typed}"
     if kind == "tests":
-        code = EXIT_CODE.search(ref)
-        if code and int(code.group(1)) != 0:
-            return f"a tests proof needs exit 0, not exit {code.group(1)}"
-        ratio = PASS_RATIO.search(ref)
-        if ratio and int(ratio.group(1)) != int(ratio.group(2)):
-            return f"a tests proof of {ratio.group(1)}/{ratio.group(2)} is not every test passing"
+        for ratio in [*PASS_RATIO.finditer(ref), *BARE_RATIO.finditer(ref)]:  # every ratio, not only the first
+            if int(ratio.group(1)) != int(ratio.group(2)):
+                return f"a tests proof of {ratio.group(1)}/{ratio.group(2)} is not every test passing"
+            if int(ratio.group(2)) == 0:
+                return f"a tests proof of {ratio.group(1)}/{ratio.group(2)} ran no test"
         if NOTHING_RAN.search(ref) or (re.search(r"\bskipped\b", ref, re.I) and not SOME_RAN.search(ref)):
             return "a tests proof where no test ran proves nothing"
+        total, skipped = RAN_TOTAL.search(ref), SKIPPED_COUNT.search(ref)
+        if total and skipped and int(total.group(1)) <= int(skipped.group(1) or skipped.group(2)):
+            return f"a tests proof of {total.group(0)!r} with {skipped.group(0)!r} skipped every test"
     if kind == "deployed":
         bad = [m.group(1) for m in HTTP_STATUS.finditer(ref) if not 200 <= int(m.group(1)) < 400]
         if bad:
             return f"a deployed proof's live check returned {bad[0]}; only a 2xx/3xx status closes"
+    return None
+
+
+def typed_red(ref: str) -> str | None:
+    """Why an explicit field in a tests/ci/deployed ref says the outcome is not green, or None (#25): a nonzero exit
+    code (exit 1, exit_code=1), a nonzero failure or error count field (failure_count=1), a success, healthy or ready
+    flag set false, an outcome field (conclusion=, status=, result=) whose value is not a green word, or a named live
+    check (readyz:503, healthz=500) that is not 2xx/3xx. Zero counts and green values stay green."""
+    code = EXIT_CODE.search(ref)
+    if code and int(code.group(1)) != 0:
+        return f"exit {code.group(1)}; only exit 0 closes"
+    count = RED_FIELD_COUNT.search(ref)
+    if count:
+        return f"{count.group(0)!r}; a nonzero failure count is not done work"
+    flag = FALSE_FLAG.search(ref)
+    if flag:
+        return f"{flag.group(0)!r}; the outcome flag says it is not green"
+    for field in OUTCOME_FIELD.finditer(ref):
+        if field.group(1).lower() not in GREEN_VALUES:
+            return f"{field.group(0)!r}; only a green outcome (success, passed, healthy) closes"
+    for status in NAMED_STATUS.finditer(ref):
+        if not 200 <= int(status.group(1)) < 400:
+            return f"{status.group(0)!r}; only a 2xx/3xx live status closes"
     return None
 
 

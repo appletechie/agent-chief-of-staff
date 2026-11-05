@@ -23,6 +23,7 @@ Sooner or later there is more than one coordinator session: a second terminal, a
 - **Every takeover increments `epoch`.** The epoch is a fencing token: see below.
 - Everything that targets "the coordinator" (timers, gate messages, intake wakes) resolves the target from the lease at send time, not from a hard-coded id.
 - **A broken lease is not "no lease".** A file that does not parse, or parses with a bad field (no primary, a `renewed_at` without a time zone, a `ttl_s` or `epoch` that is not a positive whole number), raises a named error from every read, so fenced writes refuse. Scheduled jobs read that error as "not primary here": one log line and skip. Nothing repairs it automatically; fix the field by hand, keeping the epoch. So init, renew and take refuse a naive clock before they write, rather than persist a time every later read rejects. A lease written before epochs existed is still valid.
+- **No lease is not primary either.** With no lease file nobody is primary: a scheduled job's `primary_gate()` logs one line and skips, and a fenced write refuses, instead of acting at "epoch 0" (an epoch-less lease is still epoch 0 and still acts). `init` and `take` refuse a blank session id rather than write a lease the next read rejects, and the dispatch guard's `claim()` refuses a blank name, session or worker the same way. A state file under a directory the process cannot read is an error, not "no file" (after karutoil's [#25](https://github.com/appletechie/agent-chief-of-staff/issues/25)).
 
 See [examples/lease.py](../examples/lease.py).
 

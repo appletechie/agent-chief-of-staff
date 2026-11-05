@@ -39,7 +39,7 @@ See [examples/merge_gate.py](../examples/merge_gate.py) for this as a pure funct
 - **Required checks are explicit.** Configure the checks each repo must report. A required check that has not reported means wait, not merge: the gate can't tell "no check configured" from "check never ran" on its own. A required check that was skipped is not green; one that concluded neutral ran and passes.
 - **A required check that never reports is reported.** Wait at most `check_wait` (say 30 minutes) after the last push, then report "required checks never reported". A renamed job or a path filter that skips it would otherwise stall every PR in the repo without a word.
 - **Skipped is green only for checks the repo doesn't require**, such as jobs a path filter skips for this change. This is the one place skipped counts; proof that something ran never rests on a skipped step (see the worker rules).
-- **Review verdicts are explicit where possible.** Ask the review bot (or wrap it) to end with a line `verdict: clean` or `verdict: findings`, and prefer that over phrase matching. When you must match phrases, strip the clean phrases before looking for finding words ("no major issues" contains "issue"), and treat anything unrecognised as not clean.
+- **Review verdicts are explicit where possible.** Ask the review bot (or wrap it) to end with a line `verdict: clean` or `verdict: findings`, and prefer that over phrase matching. When you must match phrases, strip the clean phrases before looking for finding words ("no major issues" contains "issue"), and treat anything unrecognised as not clean. A verdict or clean phrase inside a fenced block or an indented code block is an example, not the verdict; a fence closes only at a bare delimiter (a ```` ```not-a-close ```` line does not close it). Finding words include every severity the bot uses (`P0` to `P3`, and `P4` if it has one). An empty list ("Findings: None") and a conditional sentence about what the bot does ("if it has suggestions, it will comment") are not findings (after karutoil's [#28](https://github.com/appletechie/agent-chief-of-staff/issues/28)).
 - **Squash or your house style**, but one style, set in the script.
 - **One message per run.** If anything needs the coordinator, send one consolidated message, and append each decision to the event feed.
 
@@ -48,7 +48,7 @@ See [examples/merge_gate.py](../examples/merge_gate.py) for this as a pure funct
 If your workers open PRs as drafts by default, a gate that "readies" drafts before merging will merge drafts. That is the point of automation, and it means **draft status is not a hold**. Make holds explicit text the gate matches:
 
 - In the ledger row: `HOLD`, `HELD`, "on hold", "do not merge".
-- In the PR title or body: `Draft:`, "draft until", "merge only after", "do not merge", `WIP`, "on hold".
+- In the PR title or body: `Draft:`, "draft until", "merge only after", "do not merge", `WIP`, "on hold". Match the text as Markdown renders it, so `Draft\:` and "do **not** merge" still hold (#28).
 
 Match conservatively. "held at version 1.0" in a row's prose should not count; an uppercase `HOLD` token or a fixed phrase should. A conditional hold ("merge only after the migration is applied") stays held even after the condition is met, because the gate cannot evaluate conditions. The coordinator checks the condition and merges by hand with the expected-head guard.
 
@@ -62,7 +62,7 @@ Do not trust memory for this list. Check the platform's auto-deploy setting when
 
 - **Request once per head SHA**, after a quiet period (for example 45 minutes after the last push with no receipt). Record that you asked for that SHA so the next run does not ask again.
 - **A bot can sit "running" for a long time.** Waiting is cheaper than re-requesting; set a second, longer threshold for "tell the coordinator the review is stuck".
-- **Parse defensively.** Review bot output formats change without notice. The receipt must name the head SHA (or be attached to it by the API), and its verdict must match a known "clean" phrase. Anything you cannot parse is "not clean", reported, never merged.
+- **Parse defensively.** Review bot output formats change without notice. The receipt must name the head SHA, in full or as an abbreviation of 7+ hex characters of it (an abbreviation of any other commit does not count), or be attached to it by the API, and its verdict must match a known "clean" phrase. Anything you cannot parse is "not clean", reported, never merged.
 - **Optional second reviewer.** If the primary bot is stuck past a long threshold, a reviewer from a different model vendor may approve instead. Record which one did.
 - **Second approver.** If branch protection requires a non-author approval and your agents share an identity, decide up front whether a separate approver identity is allowed, and log every use of it.
 

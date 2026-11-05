@@ -22,7 +22,9 @@ A lease file that does not parse, or parses with a bad field (no primary, a rene
 8601 time with a time zone, a ttl_s or epoch that is not a positive whole number), raises LeaseError from every
 read: state, holder, epoch, fenced, renew and take. Nothing repairs it automatically. A scheduled job (the timer
 tick, the merge gate, intake) calls primary_gate() first: a LeaseError there reads as "not primary here", one log
-line, and the job skips. A lease written before epochs existed (no epoch field) is still valid, epoch 0.
+line, and the job skips. No lease file is the same: nobody is primary until init(), primary_gate() skips and
+fenced() raises LeaseError, so nothing writes at "epoch 0" by accident (#25). A lease written before epochs existed
+(no epoch field) is still valid, epoch 0.
 
 Lock order: the lease lock before a store lock. init, renew and take never take a store lock, so a writer that
 waits for the lease lock while holding its store lock (Timers.tick, after a send) cannot deadlock. Inside fenced(),
@@ -136,11 +138,17 @@ class Lease:
         self.lock = self.path.with_suffix(".lock")  # two simultaneous takes must not both get the same epoch
 
     def read(self) -> dict | None:
-        if not self.path.exists():
-            return None
+        """The lease, or None when there is no lease file. Path.exists() is not used: it reads False for a file
+        under an unreadable directory, and that would make "can't read the lease" look like "no lease" (#25)."""
         try:
-            lease = json.loads(self.path.read_text())
-        except (json.JSONDecodeError, OSError, UnicodeError) as error:
+            text = self.path.read_text()
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeError) as error:
+            raise LeaseError(f"state file {self.path} is unreadable: {error!s}; recover it before running the lease") from error
+        try:
+            lease = json.loads(text)
+        except ValueError as error:  # JSONDecodeError, and the int digit limit (a 4301-digit number)
             raise LeaseError(f"state file {self.path} is corrupt: {error!s}; recover it before running the lease") from error
         if not isinstance(lease, dict):
             raise LeaseError(f"state file {self.path} is not an object (got {type(lease).__name__})")
@@ -178,11 +186,15 @@ class Lease:
 
     @contextmanager
     def fenced(self, timeout: float = LOCK_TIMEOUT):
-        """Yield the current epoch while no init, renew or take can run. Pass this (lease.fenced) as a writer's fence."""
+        """Yield the current epoch while no init, renew or take can run. Pass this (lease.fenced) as a writer's fence.
+        With no lease there is no primary to fence for: LeaseError, so a fenced write never runs at "epoch 0" (#25)."""
         with file_lock(self.lock, timeout=timeout, shared=True):
+            if self.read() is None:
+                raise LeaseError(f"no lease at {self.path}; nobody is primary until init()")
             yield self.epoch()
 
     def init(self, session_id: str, host: str, now: datetime | None = None) -> dict:
+        identity(session_id, "the primary's session id")
         now = clock(now)
         with file_lock(self.lock):
             if self.read():
@@ -200,8 +212,9 @@ class Lease:
 
     def take(self, session_id: str, host: str, reason: str, now: datetime | None = None,
              force: bool = False) -> dict:
-        if not reason.strip():
+        if not isinstance(reason, str) or not reason.strip():
             raise LeaseError("a takeover needs a reason")
+        identity(session_id, "the new primary's session id")
         now = clock(now)
         with file_lock(self.lock):
             state = self.state(now)
@@ -216,10 +229,21 @@ class Lease:
                                 "renewed_at": now.isoformat(), "ttl_s": int(TTL.total_seconds()),
                                 "reason": reason, "previous": previous})
 
+def identity(value, what: str) -> None:
+    """Refuse a blank or non-string id before it is written: lease_problem() would reject the file on the next read,
+    so a blank primary would turn a working lease into a broken one (#25)."""
+    if not isinstance(value, str) or not value.strip():
+        raise LeaseError(f"{what} must be a non-empty string; nothing written")
+
+
 def primary_gate(lease: Lease, job: str, log=print) -> int | None:
     """For a scheduled job: the epoch to pass as expect_epoch, or None to skip this run. A broken lease file is
-    "not primary here": one log line, and the job does nothing (it never crashes, and never acts unfenced)."""
+    "not primary here": one log line, and the job does nothing (it never crashes, and never acts unfenced). So is no
+    lease file at all: nobody is primary until init() writes one (#25); an epoch-less lease is still epoch 0."""
     try:
+        if lease.read() is None:
+            log(f"{job}: no lease; skipped (nobody is primary until the lease is initialised)")
+            return None
         return lease.epoch()
     except LeaseError as error:
         log(f"{job}: not primary here; skipped ({error})")

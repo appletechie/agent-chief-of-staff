@@ -20,6 +20,18 @@ PENDING = {"queued", "in_progress", "pending", "waiting", "requested"}
 # Row holds are the owner's words: an uppercase token or a fixed phrase, not any prose containing "held".
 ROW_HOLD = re.compile(r"\bHOLD\b|\bHELD\b|(?i:\bon hold\b|\bdo not merge\b|\bdon'?t merge\b)")
 PR_HOLD = re.compile(r"(?i)\bdraft:|\bdraft until\b|\bmerge only after\b|\bdo not merge\b|\bdon'?t merge\b|\bon hold\b|\bwip\b")
+# Markdown that renders a hold marker: backslash escapes (Draft\:) and emphasis or code (do **not** merge) (#28).
+MD_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
+MD_MARKS = re.compile(r"[*_`~]+")
+# An indented code line (4 spaces or a tab) is an example, like a fenced block (#28).
+INDENTED = re.compile(r"^(?: {4,}|\t)")
+# "Findings: None" (or a Findings heading over "None") says the list is empty (#28).
+EMPTY_FINDINGS = re.compile(r"(?m)^[#\s*]*findings?\s*(?::\s*|\n\s*)(?:none|nothing|n/a)\.?\s*$")
+# A conditional sentence about what a bot does with findings is boilerplate, not a finding (#28):
+# "If Codex has suggestions, it will comment".
+# Only the "if ... has suggestions" clause goes: the rest of the sentence still counts.
+CONDITIONAL = re.compile(r"\bif\b[^.,;\n]{0,60}?\b(?:has|have|finds?)\s+(?:any\s+)?(?:suggestions?|issues?|findings?)\b")
+SHORT_SHA = re.compile(r"[0-9a-f]{7,40}")
 
 
 @dataclass
@@ -48,7 +60,7 @@ class PR:
 class Policy:
     deploys_on_merge: frozenset[str]
     clean_phrases: tuple[str, ...] = ("no major issues", "looks good to merge")
-    finding_phrases: tuple[str, ...] = ("issue", "finding", "suggest", "bug", "p0", "p1", "p2")
+    finding_phrases: tuple[str, ...] = ("issue", "finding", "suggest", "bug", "p0", "p1", "p2", "p3", "p4")
     # Checks each repo must report on the head SHA. A listed check that has not reported means WAIT, until
     # check_wait after the last push, then REPORT (a renamed or path-filtered job must not stall the repo quietly).
     # A listed check that was skipped is not green. Unlisted checks may be skipped (path filters).
@@ -66,8 +78,8 @@ class Decision:
 
 def _outside_fences(body: str) -> list[str]:
     """The lines of body that are not inside a fenced block. A fence opens with ``` or ~~~ and closes only at a
-    delimiter of the same character at least as long, so a backtick line inside a tilde example does not end it
-    (#22); an unclosed fence runs to the end."""
+    delimiter of the same character at least as long with nothing after it, so a backtick line inside a tilde
+    example (#22) or a ```not-a-close line (#28) does not end it; an unclosed fence runs to the end."""
     out, fence, fence_size = [], None, 0
     for line in body.splitlines():
         if opener := re.match(r"^\s*(`{3,}|~{3,})", line):
@@ -75,7 +87,7 @@ def _outside_fences(body: str) -> list[str]:
             if fence is None:
                 fence, fence_size = here[0], len(here)
                 continue
-            if fence == here[0] and len(here) >= fence_size:
+            if fence == here[0] and len(here) >= fence_size and not line[opener.end():].strip():
                 fence, fence_size = None, 0
                 continue
         if fence is None:
@@ -88,25 +100,34 @@ def _verdict_lines(body: str) -> list[str]:
 
     Bots write examples of the same format (or instructions saying to use it) in the same receipt, so a
     bare search would treat an illustrating code block as the verdict. Fenced regions are not instructions to
-    the gate.
+    the gate. Nor are indented code lines (#28).
     """
-    return [m.group(1) for line in _outside_fences(body) if (m := VERDICT_LINE.match(line))]
+    return [m.group(1) for line in _outside_fences(body) if not INDENTED.match(line) and (m := VERDICT_LINE.match(line))]
+
+
+def _is_head(sha: str, head: str) -> bool:
+    """The receipt names the head: the full SHA, or an abbreviation of it (7+ hex characters) as bots write it (#28).
+    An abbreviation of any other commit does not match."""
+    sha, head = (sha or "").strip().lower(), (head or "").lower()
+    return bool(sha) and (sha == head or (SHORT_SHA.fullmatch(sha) is not None and head.startswith(sha)))
 
 
 def review_verdict(pr: PR, policy: Policy) -> str | None:
     """'clean', 'findings', 'unparsed', or None when no receipt names the head SHA."""
-    receipts = [r for r in pr.reviews if r.sha == pr.head_sha]
+    receipts = [r for r in pr.reviews if _is_head(r.sha, pr.head_sha)]
     if not receipts:
         return None
     body = receipts[-1].body.lower()
     # Explicit verdict wins over phrases, but the last one rather than the first: a receipt that repeats its
     # convention before the actual decision should not be judged by the example.
     tokens = _verdict_lines(body)
-    # A clean phrase counts only outside fences (a quoted example is not a verdict); findings count anywhere.
-    outside = "\n".join(_outside_fences(body))
+    # A clean phrase counts only outside fences and indented code (a quoted example is not a verdict); findings
+    # count anywhere.
+    outside = "\n".join(line for line in _outside_fences(body) if not INDENTED.match(line))
     clean = any(p in outside for p in policy.clean_phrases)
     # "no issues", "no major findings" say there is nothing; they are not finding words themselves.
     residue = re.sub(r"\bno\s+(?:major\s+)?(?:issues?|findings?|bugs?)\b", " ", body)
+    residue = CONDITIONAL.sub(" ", EMPTY_FINDINGS.sub(" ", residue))
     for phrase in policy.clean_phrases:
         residue = residue.replace(phrase, " ")
     # Findings anywhere in the receipt beat a clean verdict token: the token is a summary, the list is the
@@ -116,6 +137,12 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
     if tokens:
         return tokens[-1]
     return "clean" if clean else "unparsed"
+
+
+def rendered(text: str) -> str:
+    """The words Markdown renders: escapes undone, emphasis and code marks dropped (`Draft\\:` reads `Draft:`, and
+    `do **not** merge` reads `do not merge`), so formatting never hides a hold marker (#28)."""
+    return MD_MARKS.sub("", MD_ESCAPE.sub(r"\1", text or ""))
 
 
 def review_problem(pr: PR, policy: Policy) -> str | None:
@@ -136,7 +163,7 @@ def decide(pr: PR, row_text: str, policy: Policy, now: datetime | None = None) -
     now = now or datetime.now(timezone.utc)
     if ROW_HOLD.search(row_text or ""):
         return Decision("REPORT", "row is on hold")
-    if PR_HOLD.search(f"{pr.title}\n{pr.body}"):
+    if PR_HOLD.search(rendered(f"{pr.title}\n{pr.body}")):
         return Decision("REPORT", "PR title or body carries a hold marker")
     if pr.is_draft and not policy.merge_drafts:
         return Decision("REPORT", "PR is a draft")
