@@ -119,6 +119,19 @@ class LedgerTests(TempDir):
             self.assertIn(f"ledger/notes/{row['id']}.md", row["waits"])
         self.assertEqual(led.check(), ([], []))
 
+    def test_spill_keeps_a_later_then_step(self):
+        # Issue #6, finding 4: cutting waits-on from the end dropped the owner's later step from the grid.
+        led = ls.Ledger(self.root)
+        later = "then owner: review and pay the invoice"
+        row = led.write_row(None, owner="worker-7f3a2c", next="y" * 400, waits="worker: " + "x" * 900 + "; " + later)
+        self.assertLessEqual(ls.row_chars(row), ls.ROW_BUDGET)
+        self.assertTrue(row["waits"].endswith("; " + later), row["waits"])
+        self.assertTrue(row["waits"].startswith("worker: xxx"))
+        self.assertIn(f"ledger/notes/{row['id']}.md", row["waits"])
+        self.assertEqual(ls.queue_of(row), "ACTIVE")
+        self.assertIn(later, (self.root / "ledger" / "notes" / f"{row['id']}.md").read_text())
+        self.assertEqual(led.check(), ([], []))
+
 
 class WakeGateTests(TempDir):
     def test_unchanged_then_changed(self):

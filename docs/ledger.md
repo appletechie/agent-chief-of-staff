@@ -24,7 +24,7 @@ The ledger is the coordinator's memory. It is a plain Markdown table with one ro
 ### Size limits
 
 - Keep a row under about 500 characters, owner cell excluded. Treat it as a warning, not an error: a refused write in the middle of a close-out is worse than a long row.
-- The write function spills anything longer into `ledger/notes/<id>.md`, then cuts each over-long cell (next action first, then waits on) and leaves a pointer to the note in the cut cell.
+- The write function spills anything longer into `ledger/notes/<id>.md`, then cuts each over-long cell (next action first, then waits on) and leaves a pointer to the note in the cut cell. In `waits on` it never cuts a clause that starts with "then": it cuts the longest other clause from its end, so the queue and the later step (often the owner's) both still show.
 - History, caveats, side findings and proofs go in notes or as tracker comments, never as new rows.
 
 ### When to open a row
@@ -59,7 +59,7 @@ check()                         # structural checker, exit non-zero on error
 - Make the lock re-entrant within a process and record the holder's pid and script name in the lock file, so a timeout can say who is holding it.
 - After every write, run the checker and regenerate the dashboard. If the checker fails, fix the row before doing anything else in the same turn (no sends, no archives, no closes).
 - Never hand-edit a row while another session is live.
-- With a lease, every write carries the writer's lease epoch and is refused under the lock when the lease has moved on (see [sessions-and-recovery.md](sessions-and-recovery.md#fencing)).
+- With a lease, every write carries the writer's lease epoch and is refused when the lease has moved on. The check and the write share one fence (the lease lock, held shared, taken before the ledger lock), so a takeover can't land between them (see [sessions-and-recovery.md](sessions-and-recovery.md#fencing)).
 
 See [examples/ledger_store.py](../examples/ledger_store.py).
 
