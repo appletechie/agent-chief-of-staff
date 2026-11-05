@@ -55,6 +55,23 @@ RUN_ID = re.compile(r"\b\d{6,}\b")
 COUNTS = re.compile(r"\bRan \d+\b|\b\d+\s*(?:tests?|passed|passing|failed|failures|errors|skipped)\b|\b\d+\s*/\s*\d+\b"
                     r"|\b\d+ OK\b|\bOK \(", re.I)
 CI_SUCCESS = re.compile(r"\bsuccess\b", re.I)
+# A red outcome in a tests/ci/deployed ref refuses even when "success" or a count also appears (#22). Zero counts
+# ("0 failed", "failures=0", "no errors") are removed first, so a clean summary stays green.
+ZERO_RED = re.compile(r"(?<![\w.])0\s*(?:failed|failures?|errors?)(?![A-Za-z])|(?<![A-Za-z])(?:failed|failures?|errors?)\s*[=:]\s*0(?!\d)"
+                      r"|\bno\s+(?:failures?|errors?|failed)(?![A-Za-z])", re.I)
+# Paths and file names (tests/test_errors.py) are identifiers, not outcomes: removed before the red-word check.
+PATH_LIKE = re.compile(r"[\w./-]*\.(?:py|js|jsx|ts|tsx|mjs|go|rs|rb|java|kt|swift|sh|c|cc|cpp|h|php|cs|exs?)\b")
+RED_OUTCOME = re.compile(r"(?<![\w-])(?:fail(?:ed|ure|ures|ing|s)?|errors?|cancell?ed|canceled|timed[ _-]?out|timeout"
+                         r"|unhealthy|startup_failure)(?![\w-])|\b(?:no|not|without)\s+(?:a\s+)?success|\bunsuccessful\b|\bnot\s+healthy\b"
+                         r"|\brequired\b[^;,]*\bskipped\b|\bskipped\b[^;,]*\brequired\b", re.I)
+RED_COUNT = re.compile(r"(?<![\w.])[1-9]\d*\s*(?:failed|failures?|errors?)(?![\w-])"
+                       r"|(?<![\w-])(?:failed|failures?|errors?)\s*[=:]\s*[1-9]|\bFAILED\b")
+NOTHING_RAN = re.compile(r"\bRan 0 tests?\b|(?<![\w.])0\s*(?:tests?|passed)\b", re.I)
+SOME_RAN = re.compile(r"\bRan [1-9]|(?<![\w.])[1-9]\d*\s*(?:tests?|passed|passing)\b|\bOK\b|(?<![\w.])(\d+)\s*/\s*\1\b", re.I)
+EXIT_CODE = re.compile(r"\bexit(?:\s+code)?\s*[:=]?\s*(-?\d+)", re.I)
+# a 3-digit live status, not a port (:443), part of a path or id, or a measurement (500 ms, 404 KB)
+HTTP_STATUS = re.compile(r"(?<![\w.:/-])([1-5]\d\d)(?![\w./:-]|\s*(?:ms|s|sec|secs|seconds|[kmg]i?b|bytes|%)(?![A-Za-z]))", re.I)
+PASS_RATIO = re.compile(r"(?<![\w.])(\d+)\s*/\s*(\d+)\s*(?:tests?|passed|passing|ok|green)\b", re.I)
 LIVE_STATUS = re.compile(r"(?<![\w.-])(?:[1-5]\d\d|healthy|success|passed|PASS)(?![\w-]|\.\w)")  # not inside an id
 ID_TOKEN = re.compile(r"(?<![\w.-])(?=[\w.-]*\d)[\w.-]{4,}(?![\w.-])")
 READ_BACK = re.compile(r"read[ -]?back|readback|\w\s*(?:==?|->|→)\s*\S", re.I)
@@ -64,7 +81,7 @@ WHEN = re.compile(r"\b\d{1,2}:\d\d(?!\d)")  # a time of day, not a bare date
 VOID_REASON = re.compile(r"\b(?:tests?|testing|fixture|accident\w*|mistake\w*|in error|by error|typo|stray|created by)\b",
                          re.I)
 PROOF_CELL = re.compile(r"^(?P<kind>[a-z]+): (?P<ref>.+?) - (?P<text>.+)$")
-PR_REF = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w-]*/[\w.-]+)#(\d+)\b|github\.com/([\w-]+/[\w.-]+)/pull/(\d+)")
+PR_REF = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w-]*/[\w.-]+)#(\d+)\b|github\.com/([\w-]+/[\w.-]+)/pull/(\d+)", re.I)
 
 _local = threading.local()  # re-entrancy is per thread; other threads must really wait
 
@@ -232,8 +249,9 @@ class Ledger:
         Refused before anything is written: a proof that is not evidence (ProofRefused), a folded target that is not
         an open row mentioning this one, or a can_close policy that says no (CloseRefused). The full proof goes to
         the row's note verbatim, the archive line is written next, then the ledger line is removed. A crash between
-        the two leaves the id in both places, which check() reports; finish by re-running close_row or deleting the
-        ledger line."""
+        the two leaves the id in both places, which check() reports; finish by re-running the same close_row call: it
+        finds its own archived row (same id, kind and ref), appends nothing and removes the ledger line. An id already
+        archived with other proof is refused (ids are never reused)."""
         proof = Proof(kind, " ".join(str(ref or "").split()), " ".join(str(text or "").split()))
         problem = proof_problem(proof.kind, proof.ref, proof.text)
         if problem:
@@ -254,16 +272,29 @@ class Ledger:
                 reason = self.can_close(row, proof)
                 if reason:
                     raise CloseRefused(reason)
-            archive = self.root / "ledger" / f"closed-{now:%Y-%m}.md"
-            archive.parent.mkdir(parents=True, exist_ok=True)
-            if not archive.exists():
-                archive.write_text("| id | key | closed | proof | last next action |\n|---|---|---|---|---|\n")
+            # A retry after a crash finds its own archived row: compare as archived (clean() rewrites pipes).
+            archived = [r for r in self.closed_rows() if r["id"] == row_id]
+            same = next((r for r in archived if (p := parse_proof(r["proof"])) and (p.kind, p.ref) == (proof.kind, clean(proof.ref))),
+                        None)
+            if archived and same is None:
+                raise CloseRefused(f"{row_id} is already archived in {archived[0]['_file']} with other proof "
+                                   f"({archived[0]['proof']}); ids are never reused")
             # store the proof's full text in the row's note before the archive (a table) cuts or rewrites it.
             self.notes.mkdir(parents=True, exist_ok=True)
-            with (self.notes / f"{row_id}.md").open("a") as note:
-                note.write(f"\n## proof\nkind: {kind}\nref: {ref}\n{text}\n")
-            with archive.open("a") as fh:
-                fh.write(table_line([row_id, row["key"], f"{now:%Y-%m-%d %H:%MZ}", clean(str(proof)), row["next"]]) + "\n")
+            # the note keeps the caller's ref and text verbatim (whitespace and line breaks included)
+            note_path, entry = self.notes / f"{row_id}.md", f"## proof\nkind: {kind}\nref: {ref}\n{text}\n"
+            if not (note_path.exists() and entry in note_path.read_text()):
+                with note_path.open("a") as note:
+                    note.write("\n" + entry)
+            if same is not None:
+                archive = self.root / "ledger" / same["_file"]
+            else:
+                archive = self.root / "ledger" / f"closed-{now:%Y-%m}.md"
+                archive.parent.mkdir(parents=True, exist_ok=True)
+                if not archive.exists():
+                    archive.write_text("| id | key | closed | proof | last next action |\n|---|---|---|---|---|\n")
+                with archive.open("a") as fh:
+                    fh.write(table_line([row_id, row["key"], f"{now:%Y-%m-%d %H:%MZ}", clean(str(proof)), row["next"]]) + "\n")
             del lines[row["_line"] - 1]
             atomic_write(self.path, "\n".join(lines) + "\n")
             return str(archive)
@@ -334,6 +365,23 @@ class Ledger:
             if self.require_key and r["key"] in NONE and self.require_key(r):
                 warnings.append(f"{where}: no issue key, and policy requires one for this row")
         errors += self.closed_proof_errors()
+        dup_errors, dup_warnings = self.duplicate_archive_ids()
+        return errors + dup_errors, warnings + dup_warnings
+
+    def duplicate_archive_ids(self) -> tuple[list[str], list[str]]:
+        """An id archived more than once (a retried close that appended twice, or a hand edit) claims history twice.
+        It is an error when any copy was closed at or after proof_since (always, when None), a warning otherwise."""
+        copies: dict[str, list[dict]] = {}
+        for r in self.closed_rows():
+            copies.setdefault(r["id"], []).append(r)
+        errors, warnings = [], []
+        for row_id, found in sorted(copies.items()):
+            if len(found) < 2:
+                continue
+            where = ", ".join(f"{r['_file']} ({r['closed']})" for r in found)
+            old = self.proof_since is not None and all(
+                (when := closed_time(r["closed"])) is not None and when < self.proof_since for r in found)
+            (warnings if old else errors).append(f"closed archive repeats id {row_id} {len(found)} times: {where}")
         return errors, warnings
 
     def closed_proof_errors(self) -> list[str]:
@@ -341,10 +389,7 @@ class Ledger:
         errors = []
         for r in self.closed_rows():
             where = f"{r['_file']} {r['id']}"
-            try:
-                when = datetime.strptime(r["closed"], "%Y-%m-%d %H:%MZ").replace(tzinfo=timezone.utc)
-            except ValueError:
-                when = None
+            when = closed_time(r["closed"])
             if self.proof_since is not None and when is not None and when < self.proof_since:
                 continue
             if when is None:
@@ -358,6 +403,13 @@ class Ledger:
             if problem:
                 errors.append(f"{where}: {problem}")
         return errors
+
+
+def closed_time(cell: str) -> datetime | None:
+    try:
+        return datetime.strptime(cell, "%Y-%m-%d %H:%MZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 def not_proof(value: str) -> bool:
@@ -378,7 +430,9 @@ def proof_problem(kind: str, ref: str, text: str) -> str | None:
     message  the message, comment or review id
     owner    the owner's words in quotes, with the time
     folded   the open row id it was folded into (that row must mention this one; close_row checks)
-    void     for a test or accidental row; the reason says which"""
+    void     for a test or accidental row; the reason says which
+
+    For tests, ci and deployed the outcome must be good, not only the shape: see red_outcome."""
     ref, text = " ".join(str(ref or "").split()), " ".join(str(text or "").split())
     if kind not in PROOF_KINDS:
         return f"{kind!r} is not a proof kind: {', '.join(PROOF_KINDS)}"
@@ -390,6 +444,9 @@ def proof_problem(kind: str, ref: str, text: str) -> str | None:
         return "the ref must not contain ' - ' (it separates ref from text in the archive)"
     if not_proof(ref) or not_proof(text):
         return f"{ref if not_proof(ref) else text!r} is a claim, not proof"
+    red = red_outcome(kind, ref, text)
+    if red:
+        return red
     if kind == "tests" and not (COUNTS.search(ref) or RUN_ID.search(ref)):
         return "a tests proof needs the counts or a run id, not prose"
     if kind == "ci" and not ((RUN_ID.search(ref) or SHA.search(ref)) and CI_SUCCESS.search(ref)):
@@ -412,16 +469,46 @@ def proof_problem(kind: str, ref: str, text: str) -> str | None:
     return None
 
 
+def red_outcome(kind: str, ref: str, text: str) -> str | None:
+    """Why a tests/ci/deployed proof reports a failed, cancelled, timed-out or empty run, or None (#22). The ref is
+    the result, so any red word in it refuses, even beside "success": FAILED, a nonzero failure or error count,
+    cancelled, timed out, "no success", a required check skipped, a nonzero exit, 63/64, nothing ran, a 4xx/5xx live
+    status, unhealthy. The text describes, so only a nonzero failure count or a FAILED summary in it refuses."""
+    if kind not in ("tests", "ci", "deployed"):
+        return None
+    ref_red = RED_OUTCOME.search(ZERO_RED.sub(" ", PATH_LIKE.sub(" ", ref)))
+    if ref_red:
+        return f"the {kind} proof reports {ref_red.group(0)!r}; a failed, cancelled or timed-out run is not done work"
+    text_red = RED_COUNT.search(ZERO_RED.sub(" ", PATH_LIKE.sub(" ", text)))
+    if text_red:
+        return f"the {kind} proof's text reports {text_red.group(0)!r}; a failed run is not done work"
+    if kind == "tests":
+        code = EXIT_CODE.search(ref)
+        if code and int(code.group(1)) != 0:
+            return f"a tests proof needs exit 0, not exit {code.group(1)}"
+        ratio = PASS_RATIO.search(ref)
+        if ratio and int(ratio.group(1)) != int(ratio.group(2)):
+            return f"a tests proof of {ratio.group(1)}/{ratio.group(2)} is not every test passing"
+        if NOTHING_RAN.search(ref) or (re.search(r"\bskipped\b", ref, re.I) and not SOME_RAN.search(ref)):
+            return "a tests proof where no test ran proves nothing"
+    if kind == "deployed":
+        bad = [m.group(1) for m in HTTP_STATUS.finditer(ref) if not 200 <= int(m.group(1)) < 400]
+        if bad:
+            return f"a deployed proof's live check returned {bad[0]}; only a 2xx/3xx status closes"
+    return None
+
+
 def parse_proof(cell: str) -> Proof | None:
     m = PROOF_CELL.match((cell or "").strip())
     return Proof(m["kind"], m["ref"], m["text"]) if m else None
 
 
 def pr_refs(text: str) -> list[tuple[str, int]]:
-    """Every GitHub PR named in text, as (owner/repo, number): owner/repo#N or a github.com pull URL."""
+    """Every GitHub PR named in text, as (owner/repo, number): owner/repo#N or a github.com pull URL. Host, owner
+    and repo are case-insensitive on GitHub, so GITHUB.COM/Org/App and org/app name one PR, returned lower case (#22)."""
     out = []
     for m in PR_REF.finditer(text or ""):
-        pr = (m[1], int(m[2])) if m[1] else (m[3], int(m[4]))
+        pr = (m[1].lower(), int(m[2])) if m[1] else (m[3].lower(), int(m[4]))
         if pr not in out:
             out.append(pr)
     return out

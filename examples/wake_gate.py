@@ -151,7 +151,7 @@ def run(collectors: dict[str, Collector], state_path: Path, persist: bool, now: 
         previous = json.loads(state_path.read_text()) if state_path.exists() else {}
         if not isinstance(previous, dict):
             raise ValueError("snapshot is not an object")
-    except (json.JSONDecodeError, ValueError) as error:
+    except (json.JSONDecodeError, ValueError, OSError, UnicodeError) as error:
         previous = {"__unreadable__": str(error)}   # marks the previous snapshot unavailable; saves a fresh one
     result = evaluate(collectors, previous, now, **kwargs)
     if persist:

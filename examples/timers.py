@@ -123,7 +123,7 @@ def parse_due(text: str | None, now: datetime) -> tuple[datetime, str | None]:
         if due.tzinfo is None:
             raise ValueError("no time zone")
         return due, None
-    except ValueError:
+    except (ValueError, OverflowError, TypeError):
         return now + DEFAULT_DELAY, f"unreadable due {text!r}; defaulted to +60m"
 
 
@@ -210,8 +210,8 @@ class Timers:
             return []
         try:
             timers = json.loads(self.path.read_text())
-        except json.JSONDecodeError as error:
-            raise TimersCorrupt(f"{self.path}: timers.json is corrupt (line {error.lineno} column {error.colno})") from error
+        except (json.JSONDecodeError, OSError, UnicodeError) as error:
+            raise TimersCorrupt(f"{self.path}: timers.json is corrupt: {error!s}") from error
         if not isinstance(timers, list):
             raise TimersCorrupt(f"{self.path}: expected an array of timer objects")
         return timers  # each record is checked by timer_problem() where it is used
@@ -226,11 +226,14 @@ class Timers:
     def add(self, row: str, due: str, name: str, prompt: str, target: str = "coordinator",
             owner: str = "coordinator", source: str = "cli", now: datetime | None = None,
             expect_epoch: int | None = None) -> dict:
+        for field, values in (("row", row), ("name", name), ("prompt", prompt), ("target", target)):
+            if not isinstance(values, str) or not values.strip():
+                raise ValueError(f"timer {field} must be non-empty; a blank value would make the record unreadable")
         now = clock(now)
         when, note = parse_due(due, now)
         with self._fenced(expect_epoch), file_lock(self.lock):
             timers = self.load()
-            taken = {t.get("id") for t in timers if isinstance(t, dict)}
+            taken = {t["id"] for t in timers if isinstance(t, dict) and isinstance(t.get("id"), str)}
             # token_hex collision is rare; a pasted, broken or exhausted RNG must not wedge the store with a
             # never-ending redraw while it holds lock.
             for _ in range(10):
@@ -271,8 +274,12 @@ class Timers:
     def _tick(self, send, open_rows: set[str], now: datetime, expect_epoch: int | None) -> list[str]:
         with self._fenced(expect_epoch):
             timers, log, invalid = self.load(), [], set()
+            ids = [t["id"] for t in timers if isinstance(t, dict) and isinstance(t.get("id"), str)]
             for index, t in enumerate(timers):
                 problem = timer_problem(t)
+                if not problem and ids.count(t["id"]) > 1:
+                    # two records with one id: neither can be told apart in the log or proven undelivered (#22)
+                    problem = f"id appears {ids.count(t['id'])} times; neither copy is sent"
                 if problem:
                     invalid.add(index)
                     ref = t["id"] if isinstance(t, dict) and isinstance(t.get("id"), str) else f"record {index}"

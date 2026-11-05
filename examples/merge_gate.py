@@ -48,7 +48,7 @@ class PR:
 class Policy:
     deploys_on_merge: frozenset[str]
     clean_phrases: tuple[str, ...] = ("no major issues", "looks good to merge")
-    finding_phrases: tuple[str, ...] = ("issue", "finding", "suggest", "bug", "p1", "p2")
+    finding_phrases: tuple[str, ...] = ("issue", "finding", "suggest", "bug", "p0", "p1", "p2")
     # Checks each repo must report on the head SHA. A listed check that has not reported means WAIT, until
     # check_wait after the last push, then REPORT (a renamed or path-filtered job must not stall the repo quietly).
     # A listed check that was skipped is not green. Unlisted checks may be skipped (path filters).
@@ -64,6 +64,25 @@ class Decision:
     reason: str
 
 
+def _outside_fences(body: str) -> list[str]:
+    """The lines of body that are not inside a fenced block. A fence opens with ``` or ~~~ and closes only at a
+    delimiter of the same character at least as long, so a backtick line inside a tilde example does not end it
+    (#22); an unclosed fence runs to the end."""
+    out, fence, fence_size = [], None, 0
+    for line in body.splitlines():
+        if opener := re.match(r"^\s*(`{3,}|~{3,})", line):
+            here = opener.group(1)
+            if fence is None:
+                fence, fence_size = here[0], len(here)
+                continue
+            if fence == here[0] and len(here) >= fence_size:
+                fence, fence_size = None, 0
+                continue
+        if fence is None:
+            out.append(line)
+    return out
+
+
 def _verdict_lines(body: str) -> list[str]:
     """Token values on verdict lines **outside** fenced blocks, in file order.
 
@@ -71,14 +90,7 @@ def _verdict_lines(body: str) -> list[str]:
     bare search would treat an illustrating code block as the verdict. Fenced regions are not instructions to
     the gate.
     """
-    out, fence = [], False
-    for line in body.splitlines():
-        if line.lstrip().startswith("```"):
-            fence = not fence
-            continue
-        if not fence and (m := VERDICT_LINE.match(line)):
-            out.append(m.group(1))
-    return out
+    return [m.group(1) for line in _outside_fences(body) if (m := VERDICT_LINE.match(line))]
 
 
 def review_verdict(pr: PR, policy: Policy) -> str | None:
@@ -90,8 +102,11 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
     # Explicit verdict wins over phrases, but the last one rather than the first: a receipt that repeats its
     # convention before the actual decision should not be judged by the example.
     tokens = _verdict_lines(body)
-    clean = any(p in body for p in policy.clean_phrases)
-    residue = body
+    # A clean phrase counts only outside fences (a quoted example is not a verdict); findings count anywhere.
+    outside = "\n".join(_outside_fences(body))
+    clean = any(p in outside for p in policy.clean_phrases)
+    # "no issues", "no major findings" say there is nothing; they are not finding words themselves.
+    residue = re.sub(r"\bno\s+(?:major\s+)?(?:issues?|findings?|bugs?)\b", " ", body)
     for phrase in policy.clean_phrases:
         residue = residue.replace(phrase, " ")
     # Findings anywhere in the receipt beat a clean verdict token: the token is a summary, the list is the

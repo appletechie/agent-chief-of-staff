@@ -140,8 +140,8 @@ class Lease:
             return None
         try:
             lease = json.loads(self.path.read_text())
-        except json.JSONDecodeError as error:
-            raise LeaseError(f"state file {self.path} is corrupt: {error.lineno}:{error.colno} {error.msg}; recover it before running the lease") from error
+        except (json.JSONDecodeError, OSError, UnicodeError) as error:
+            raise LeaseError(f"state file {self.path} is corrupt: {error!s}; recover it before running the lease") from error
         if not isinstance(lease, dict):
             raise LeaseError(f"state file {self.path} is not an object (got {type(lease).__name__})")
         problem = lease_problem(lease)

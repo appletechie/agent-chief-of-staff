@@ -65,7 +65,7 @@ Before creating anything, refuse if any of these is true:
 
 Rules:
 
-- **A failed check is a warning, never a silent pass.** If the VCS search errors out, say so in the output. Decide explicitly whether that blocks.
+- **A failed check is a warning, never a silent pass.** If a lookup errors out, say so in the output. A failed or malformed open-PR search also refuses: it cannot rule out a competing PR. Check each record on its own, so a malformed one never hides a valid one after it.
 - **Override only with a reason**: `--allow-duplicate "taking over: original worker died at 14:10Z"`. The reason is recorded with the dispatch.
 - A second worker on the same row is allowed only with an explicit flag (`--add-worker`); the first stays the owner of record.
 - Test the guard by replaying the incident that motivated it (an open PR by a teammate must refuse), plus a negative case.
