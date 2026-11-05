@@ -69,6 +69,10 @@ class RefusedProof(ProofKindsBase):
             with self.subTest(kind=kind):
                 self.assertIsNotNone(ls.proof_problem(kind, ref, "what it proves"))
 
+    def test_owner_needs_a_time_not_just_a_date(self):
+        self.assertIsNotNone(ls.proof_problem("owner", '"ship it" 2026-01-16', "owner decided"))
+        self.assertIsNotNone(ls.proof_problem("owner", "ship it 14:02Z", "owner decided"))
+
     def test_ref_must_not_hold_the_separator(self):
         self.assertIsNotNone(ls.proof_problem("owner", '"close it - now" 14:02Z', "owner decided"))
 

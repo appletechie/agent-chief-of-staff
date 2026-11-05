@@ -60,7 +60,7 @@ ID_TOKEN = re.compile(r"(?<![\w.-])(?=[\w.-]*\d)[\w.-]{4,}(?![\w.-])")
 READ_BACK = re.compile(r"read[ -]?back|readback|\w\s*(?:==?|->|→)\s*\S", re.I)
 MESSAGE_ID = re.compile(r"\d{4,}")
 QUOTED = re.compile(r"[\"'“‘][^\"“”‘’]+?[\"'”’]")
-WHEN = re.compile(r"\b\d{1,2}:\d\d\b|\b\d{4}-\d\d-\d\d\b|\b\d\d-\d\d\b")
+WHEN = re.compile(r"\b\d{1,2}:\d\d(?!\d)")  # a time of day, not a bare date
 VOID_REASON = re.compile(r"\b(?:tests?|testing|fixture|accident\w*|mistake\w*|in error|by error|typo|stray|created by)\b",
                          re.I)
 PROOF_CELL = re.compile(r"^(?P<kind>[a-z]+): (?P<ref>.+?) - (?P<text>.+)$")
