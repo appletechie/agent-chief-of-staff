@@ -88,6 +88,37 @@ class LedgerTests(TempDir):
         for waits, queue in cases.items():
             self.assertEqual(ls.queue_of({"waits": waits}), queue, waits)
 
+    def test_queue_reads_the_owner(self):
+        # Issue #3, finding 5: a row the owner holds with nothing blocking it is not ready for a worker.
+        cases = [("owner", "—", "DECISION"), ("owner", "", "DECISION"), ("worker-7f3a2c", "—", "ACTIVE"),
+                 ("coordinator", "—", "ACTIVE"), ("coordinator (owner closed: 7f3a2c)", "—", "ACTIVE"),
+                 ("owner", "owner: hands", "HANDS"), ("owner", "time", "TIME"), ("owner", "worker", "ACTIVE")]
+        for owner, waits, queue in cases:
+            self.assertEqual(ls.queue_of({"owner": owner, "waits": waits}), queue, (owner, waits))
+
+    def test_missing_key_warns_where_policy_requires_one(self):
+        # Issue #3, finding 6: the checker implements the documented key warning.
+        led = ls.Ledger(self.root, require_key=lambda r: r["owner"].startswith("worker-"))
+        led.write_row(None, owner="worker-7f3a2c", next="fix the loop")
+        led.write_row(None, owner="owner", next="pick a price")
+        led.write_row(None, key="ISSUE-2", owner="worker-7f3a2c", next="keyed")
+        errors, warnings = led.check()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("R-001", warnings[0])
+        self.assertEqual(ls.Ledger(self.root).check(), ([], []))
+
+    def test_spill_cuts_every_long_cell(self):
+        # Issue #3, finding 6: a long waits-on is cut too, so the row stops warning on every check.
+        led = ls.Ledger(self.root)
+        for fields in ({"next": "short", "waits": "w" * 900}, {"next": "n" * 900, "waits": "w" * 900}):
+            row = led.write_row(None, **fields)
+            self.assertLessEqual(ls.row_chars(row), ls.ROW_BUDGET, fields.keys())
+            note = (self.root / "ledger" / "notes" / f"{row['id']}.md").read_text()
+            self.assertIn("w" * 900, note)
+            self.assertIn(f"ledger/notes/{row['id']}.md", row["waits"])
+        self.assertEqual(led.check(), ([], []))
+
 
 class WakeGateTests(TempDir):
     def test_unchanged_then_changed(self):
@@ -123,6 +154,17 @@ class WakeGateTests(TempDir):
         data["n"] = 2
         self.assertTrue(wg.run(sources, path, persist=False, now=T0 + timedelta(minutes=1)).changed)
         self.assertTrue(wg.run(sources, path, persist=True, now=T0 + timedelta(minutes=2)).changed)
+
+    def test_future_snapshot_forces_a_pass(self):
+        # Issue #3, finding 6: a last-pass time ahead of the clock must not stretch the quiet period.
+        path = self.root / "wg.json"
+        sources = {"ledger": lambda: {"R-001": 1}}
+        wg.run(sources, path, persist=True, now=T0 + timedelta(days=10))
+        result = wg.run(sources, path, persist=True, now=T0 + timedelta(days=5))
+        self.assertTrue(result.changed)
+        self.assertIn("in the future", result.render())
+        self.assertEqual(json.loads(path.read_text())["last_changed_at"], (T0 + timedelta(days=5)).isoformat())
+        self.assertFalse(wg.run(sources, path, persist=True, now=T0 + timedelta(days=5, hours=1)).changed)
 
     def test_new_only_parts_ignore_resolved_items(self):
         path = self.root / "wg.json"
@@ -163,14 +205,28 @@ class TimerTests(TempDir):
         self.assertEqual(store.load()[0]["state"], "cancelled")
 
     def test_send_errors_retry_then_fail(self):
+        # Issue #3, finding 6: retries are bounded by time since the first attempt, not by a count of ticks.
         store = tm.Timers(self.root / "t.json")
         store.add("R-001", "+1m", "x", "p", now=T0)
 
         def boom(*_):
             raise ConnectionError
-        for i in range(tm.MAX_ATTEMPTS):
-            store.tick(boom, {"R-001"}, now=T0 + timedelta(minutes=5 + i))
+        first = T0 + timedelta(minutes=5)
+        for i in range(10):
+            store.tick(boom, {"R-001"}, now=first + timedelta(minutes=i))
+        self.assertEqual((store.load()[0]["state"], store.load()[0]["attempts"]), ("armed", 10))
+        sent = []
+        store.tick(lambda target, text: sent.append(text) or "ok", {"R-001"}, now=first + timedelta(minutes=30))
+        self.assertEqual((len(sent), store.load()[0]["state"]), (1, "delivered"))
+
+        store = tm.Timers(self.root / "t2.json")
+        store.add("R-001", "+1m", "x", "p", now=T0)
+        store.tick(boom, {"R-001"}, now=first)
+        store.tick(boom, {"R-001"}, now=first + tm.RETRY_WINDOW - timedelta(minutes=1))
+        self.assertEqual(store.load()[0]["state"], "armed")
+        log = store.tick(boom, {"R-001"}, now=first + tm.RETRY_WINDOW)
         self.assertEqual(store.load()[0]["state"], "failed")
+        self.assertIn("retry window over", log[0])
 
 
 class GuardTests(TempDir):
@@ -255,10 +311,23 @@ class MergeGateTests(unittest.TestCase):
     def test_required_checks(self):
         # Issue #1, findings 2 and 3: a required check must report and must pass; unlisted checks may skip.
         policy = mg.Policy(deploys_on_merge=frozenset(), required_checks={"org/app": frozenset({"test", "e2e"})})
-        decide = lambda **kw: mg.decide(self.pr(**kw), "fix it", policy, now=T0 + timedelta(hours=1)).action
-        self.assertEqual(decide(checks={"test": "success"}), "WAIT")
+        decide = lambda now=T0 + timedelta(hours=1), **kw: mg.decide(self.pr(**kw), "fix it", policy, now=now).action
+        self.assertEqual(decide(checks={"test": "success"}, now=T0 + timedelta(minutes=10)), "WAIT")
         self.assertEqual(decide(checks={"test": "success", "e2e": "skipped"}), "REPORT")
         self.assertEqual(decide(checks={"test": "success", "e2e": "success", "lint": "skipped"}), "MERGE")
+        # Issue #3, finding 4: neutral on a required check passes (as the VCS host's own gate treats it);
+        # skipped on a required check stays red.
+        self.assertEqual(decide(checks={"test": "success", "e2e": "neutral"}), "MERGE")
+        self.assertEqual(decide(checks={"test": "neutral", "e2e": "skipped"}), "REPORT")
+
+    def test_required_check_that_never_reports_is_reported(self):
+        # Issue #3, finding 4: a missing required check waits for check_wait after the last push, then reports.
+        policy = mg.Policy(deploys_on_merge=frozenset(), required_checks={"org/app": frozenset({"test", "e2e"})})
+        decide = lambda after: mg.decide(self.pr(checks={"test": "success"}), "fix it", policy, now=T0 + after)
+        self.assertEqual(decide(policy.check_wait - timedelta(minutes=1)).action, "WAIT")
+        for after in (policy.check_wait, timedelta(days=1), timedelta(days=30)):
+            got = decide(after)
+            self.assertEqual((got.action, got.reason), ("REPORT", "required checks never reported: e2e"))
 
     def test_deploy_on_merge_repo_is_never_auto_merged(self):
         self.assertEqual(self.action(repo="org/site"), "REPORT")
@@ -277,8 +346,23 @@ class LeaseTests(TempDir):
             lease.renew("b", now=T0)
         with self.assertRaises(lz.LeaseError):
             lease.take("b", "host-b", reason="")
-        lease.take("b", "host-b", reason="planned rollover", now=T0)
+        lease.take("b", "host-b", reason="old primary silent past its TTL", now=T0 + timedelta(hours=3))
         self.assertTrue(lease.is_primary("b"))
+
+    def test_take_needs_expiry_or_force_and_bumps_the_epoch(self):
+        # Issue #3, finding 3: a held lease is not taken by accident; every take moves the fencing token.
+        lease = lz.Lease(self.root / "lease.json")
+        lease.init("a", "host-a", now=T0)
+        self.assertEqual(lease.epoch(), 1)
+        with self.assertRaises(lz.LeaseError):
+            lease.take("b", "host-b", reason="planned rollover", now=T0 + timedelta(minutes=10))
+        self.assertEqual((lease.holder(), lease.epoch()), ("a", 1))
+        lease.take("b", "host-b", reason="planned rollover", now=T0 + timedelta(minutes=10), force=True)
+        self.assertEqual((lease.holder(), lease.epoch()), ("b", 2))
+        prev = lease.read()["previous"]
+        self.assertEqual((prev["primary"], prev["epoch"], prev["renewed_at"], prev["state_at_take"]),
+                         ("a", 1, T0.isoformat(), "held"))
+        self.assertEqual(lease.renew("b", now=T0 + timedelta(minutes=20))["epoch"], 2)
 
 
 if __name__ == "__main__":

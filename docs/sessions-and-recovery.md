@@ -11,16 +11,32 @@ Sooner or later there is more than one coordinator session: a second terminal, a
   "since": "2026-01-16T09:00:00Z",
   "renewed_at": "2026-01-16T14:30:02Z",
   "ttl_s": 7200,
-  "reason": "initial"
+  "epoch": 1,
+  "reason": "initial",
+  "previous": null
 }
 ```
 
 - Exactly one session is primary: the one named in `state/lease.json`.
 - The primary renews the lease on every pass (the wake gate is a convenient place).
-- **An expired lease is flagged, never taken over automatically.** Automatic takeover turns a slow primary into two primaries. Takeover is an explicit command with a reason.
+- **An expired lease is flagged, never taken over automatically.** Automatic takeover turns a slow primary into two primaries. Takeover is an explicit command with a reason, and it refuses a lease that is still held unless forced (`--force`, for a planned rollover). It records the previous holder, its host, its epoch and when it was last seen.
+- **Every takeover increments `epoch`.** The epoch is a fencing token: see below.
 - Everything that targets "the coordinator" (timers, gate messages, intake wakes) resolves the target from the lease at send time, not from a hard-coded id.
 
 See [examples/lease.py](../examples/lease.py).
+
+### Fencing
+
+A lease nothing checks is advice. The case it must survive: the primary's laptop sleeps past the TTL, another session takes over, and the laptop wakes mid-turn still believing it is primary. A lock serializes both sessions' writes happily; it does not stop the stale one.
+
+So every shared write carries the writer's epoch and is refused when it is not the lease's current epoch:
+
+- the ledger (`write_row`, `close_row`), timers (`add`, `tick`) and the wake-gate save each take `expect_epoch`;
+- the store compares it with the lease file under its own lock, so a takeover that lands mid-write is ordered after that write, and every later write from the old epoch is refused;
+- the primary gets its epoch from its renewal at the start of each pass; a companion reads it at boot;
+- a refused write means "re-read the lease": the old primary finds it is no longer primary, says so, and continues as a companion.
+
+In the sketches each store accepts `lease_epoch=lease.epoch` (a callable, so the modules stay independent) and, once given one, refuses any write without the current epoch. A single-session setup can leave it unset.
 
 ## Primary vs companion
 
@@ -95,7 +111,7 @@ Long-lived coordinator sessions get large. A rollover starts a fresh coordinator
 
 ### Emergency takeover
 
-`lease take <new id> --reason "<why>"`, after confirming the old primary is really gone (no recent activity, not mid-turn). Then run a full pass.
+`lease take <new id> --reason "<why>"` once the lease has expired, after confirming the old primary is really gone (no recent activity, not mid-turn); add `--force` only when the old primary cannot renew but is not yet expired. The new epoch fences the old primary if it comes back anyway. Then run a full pass.
 
 ### Where rollbacks live
 
@@ -115,4 +131,5 @@ Every row that made a change names its rollback command. If you cannot write the
 | Dispatcher refuses | Duplicate guard hit | Take over or wait; override only with a recorded reason |
 | Owner of an open row is archived | Bulk archive, cascade, or pruner | Restore guard each pass; re-dispatch if restore fails |
 | Gate merged something meant to wait | Draft treated as hold; hold not written as text | Explicit hold markers in row and PR body |
-| Two sessions acted on the same change | Companion saved the shared snapshot | Snapshot save refuses unless the caller holds the lease |
+| Two sessions acted on the same change | Companion saved the shared snapshot | Snapshot save refuses unless the caller holds the current lease epoch |
+| A session's writes are refused with a stale epoch | The lease was taken while it slept or stalled | Re-read the lease and the state it guards before writing again; continue as a companion |

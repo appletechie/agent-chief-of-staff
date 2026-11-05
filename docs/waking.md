@@ -28,8 +28,8 @@ A script, run at the start of every periodic wake, that:
 ### Rules
 
 - **An unreadable source counts as CHANGED** and keeps its previous snapshot. A broken collector must never look like a quiet system.
-- **Force a pass after a maximum quiet period** (for example 4 hours), so nothing outside the hashed sources goes unchecked forever.
-- **Only the lease holder saves the shared snapshot.** A companion either runs with `--no-save` or keeps its own snapshot file. Otherwise a companion's look would "consume" a change and the primary would never act on it.
+- **Force a pass after a maximum quiet period** (for example 4 hours), so nothing outside the hashed sources goes unchecked forever. A saved last-pass time in the future (clock skew, restored or copied state) also forces a pass, and the saved time is clamped to now; otherwise every gap looks short.
+- **Only the lease holder saves the shared snapshot.** A companion either runs with `--no-save` or keeps its own snapshot file. Otherwise a companion's look would "consume" a change and the primary would never act on it. The save carries the caller's lease epoch and is refused when the lease has moved on (see [sessions-and-recovery.md](sessions-and-recovery.md#fencing)).
 - **A dropped wake never runs the gate**, so its changes simply show up on the next one. That is the property that makes the gate safe against missed heartbeats.
 - On UNCHANGED, the coordinator replies with one line and re-reads nothing.
 
@@ -60,7 +60,9 @@ A tick script runs every minute from the OS scheduler and delivers due timers.
 
 - **Deliver by message, not by starting a run.** Many agent runners reject "start a turn" on an agent that is already mid-turn, and some schedulers then mark the run failed and never retry. A queued message that is injected when the agent next becomes free does not have that problem. If your runner only offers "start a run", have the tick script retry until it succeeds.
 - **At most once.** Mark the timer `sending` and persist that *before* sending; mark `delivered` with the receipt after. A timer found in `sending` on the next tick (a crash mid-send) becomes `failed` and is surfaced, never resent blind.
-- **Bounded retries.** A send error retries on later ticks up to a limit (say 5), then `failed`.
+- **One tick at a time, under a lock.** Every read-modify-write of `timers.json` takes one exclusive lock: `add` waits for it, `tick` never does. A second tick that finds the lock held logs "another tick is running" and delivers nothing, so a send that outlives the next minute (the normal case for a busy session) is neither repeated nor mistaken for a crash. The tick holds the lock across each send, which is what makes `sending` on disk mean "crashed". The cost: an `add` during a slow send waits, up to the lock timeout, then fails loudly. If adds must always be fast, append them to a separate log and have the tick fold that log into `timers.json` under its lock.
+- **Bounded retries, by time.** A send error retries on later ticks until a deadline (say 4 hours after the first attempt), then `failed`. Count time, not attempts: with a one-minute tick, five attempts is five minutes of outage.
+- **Fenced.** Adds and ticks carry the caller's lease epoch; a tick from a primary that has been replaced delivers nothing, and a takeover during a long tick stops it before its next send.
 - **Skip what no longer matters.** A due timer whose row is closed is cancelled with a reason, not delivered. Put reminders on open rows.
 - **Check the owner when a timer fires.** If the worker it was about is closed or archived, read its last report and update the row; re-dispatch only if work remains.
 - **Optional busy deferral.** If delivering into a busy session would interrupt the owner's live conversation, defer for a bounded time (say up to 30 min), then deliver anyway.

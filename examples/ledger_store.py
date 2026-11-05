@@ -8,6 +8,9 @@ Layout (relative to a root directory):
     state/ledger.lock           advisory lock
 
 Standard library only. Uses fcntl, so POSIX; swap file_lock() for another primitive elsewhere.
+
+Fencing: build the Ledger with lease_epoch (a callable returning the lease's current epoch, e.g. Lease.epoch) and
+every write must pass expect_epoch; a stale epoch is refused under the lock (see lease.py).
 """
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 COLUMNS = ["id", "key", "owner", "next action", "waits on", "due"]
 FIELDS = ["id", "key", "owner", "next", "waits", "due"]
@@ -31,12 +35,17 @@ OWNER = re.compile(r"^(owner|coordinator(?: \(owner closed: [\w-]+\))?|worker-[0
 DUE = re.compile(r"^(\d{2}-\d{2}(?: \d{2}:\d{2}Z)?|\d{4}-\d{2}-\d{2})$")
 QUEUES = ("ACTIVE", "DECISION", "HANDS", "PEOPLE", "TIME")
 LOCK_TIMEOUT = 20.0
+SPILL_ORDER = ("next", "waits")  # free-text cells cut to fit the budget; id, key and due are short by format
 
 _local = threading.local()  # re-entrancy is per thread; other threads must really wait
 
 
 class LockTimeout(RuntimeError):
     pass
+
+
+class StaleEpoch(RuntimeError):
+    """The lease was taken after the caller read its epoch: re-read the lease before writing again."""
 
 
 @contextmanager
@@ -77,11 +86,22 @@ def file_lock(path: Path, timeout: float = LOCK_TIMEOUT):
 
 
 class Ledger:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, lease_epoch: Callable[[], int] | None = None,
+                 require_key: Callable[[dict], bool] | None = None):
+        """require_key(row) -> True where your policy needs an issue key, e.g. lambda r: r["owner"].startswith("worker-")."""
         self.root = Path(root)
         self.path = self.root / "LEDGER.md"
         self.notes = self.root / "ledger" / "notes"
         self.lock = self.root / "state" / "ledger.lock"
+        self.lease_epoch = lease_epoch
+        self.require_key = require_key
+
+    def _fence(self, expect_epoch: int | None) -> None:
+        if self.lease_epoch is None:
+            return
+        current = self.lease_epoch()
+        if expect_epoch != current:
+            raise StaleEpoch(f"lease epoch is {current}, caller holds {expect_epoch}; re-read the lease")
 
     # ---------- reading ----------
 
@@ -116,9 +136,10 @@ class Ledger:
 
     # ---------- writing ----------
 
-    def write_row(self, row_id: str | None, **fields) -> dict:
+    def write_row(self, row_id: str | None, expect_epoch: int | None = None, **fields) -> dict:
         """Create (row_id=None) or update a row. Long text spills to notes; returns the row written."""
         with file_lock(self.lock):
+            self._fence(expect_epoch)
             lines = self._lines()
             rows = {r["id"]: r for r in self.rows()}
             if row_id is None:
@@ -140,12 +161,16 @@ class Ledger:
             atomic_write(self.path, "\n".join(lines) + "\n")
             return current
 
-    def close_row(self, row_id: str, proof: str, now: datetime | None = None) -> str:
-        """Move a row to ledger/closed-YYYY-MM.md with its proof. Proof is mandatory."""
+    def close_row(self, row_id: str, proof: str, now: datetime | None = None, expect_epoch: int | None = None) -> str:
+        """Move a row to ledger/closed-YYYY-MM.md with its proof. Proof is mandatory.
+
+        The archive line is written before the ledger line is removed. A crash between the two leaves the id in
+        both places, which check() reports; finish by re-running close_row or deleting the ledger line."""
         if not proof or not proof.strip():
             raise ValueError("a row closes only with proof")
         now = now or datetime.now(timezone.utc)
         with file_lock(self.lock):
+            self._fence(expect_epoch)
             lines = self._lines()
             match = [r for r in self.rows() if r["id"] == row_id]
             if not match:
@@ -162,6 +187,7 @@ class Ledger:
             return str(archive)
 
     def _spill(self, row: dict) -> dict:
+        """Over budget: save the full text to the row's note, then cut next action, then waits on, until it fits."""
         if row_chars(row) <= ROW_BUDGET:
             return row
         self.notes.mkdir(parents=True, exist_ok=True)
@@ -171,8 +197,13 @@ class Ledger:
             fh.write(f"\n## {stamp}\nnext action: {row['next']}\nwaits on: {row['waits']}\n")
         row = dict(row)
         pointer = f" (detail: ledger/notes/{row['id']}.md)"
-        room = ROW_BUDGET - row_chars({**row, "next": ""}) - len(pointer)
-        row["next"] = row["next"][: max(room, 40)].rstrip() + pointer
+        for k in SPILL_ORDER:
+            over = row_chars(row) - ROW_BUDGET
+            if over <= 0:
+                break
+            keep = max(len(row[k]) - over - len(pointer), 40)
+            if keep < len(row[k]):
+                row[k] = row[k][:keep].rstrip() + pointer
         return row
 
     # ---------- checking ----------
@@ -205,15 +236,22 @@ class Ledger:
                 errors.append(f"{where}: due must be MM-DD, MM-DD HH:MMZ or YYYY-MM-DD")
             if row_chars(r) > ROW_BUDGET:
                 warnings.append(f"{where}: {row_chars(r)} chars, budget {ROW_BUDGET}")
+            if self.require_key and r["key"] in NONE and self.require_key(r):
+                warnings.append(f"{where}: no issue key, and policy requires one for this row")
         return errors, warnings
 
 
 def queue_of(row: dict) -> str:
-    """Derive a row's queue from its owner and the first clause of waits-on. Later clauses start with 'then'."""
+    """Derive a row's queue from its owner and the first clause of waits-on. Later clauses start with 'then'.
+
+    A row the owner holds with nothing in waits-on is DECISION, not ACTIVE: the brief lists it with options,
+    and no pass dispatches a worker onto the owner's own task."""
     first = next((c.strip() for c in (row.get("waits") or "").split(";")
                   if c.strip() and not c.strip().lower().startswith("then")), "")
     low = first.lower()
-    if first in NONE or low.startswith(("worker", "coordinator")):
+    if first in NONE:
+        return "DECISION" if (row.get("owner") or "").strip() == "owner" else "ACTIVE"
+    if low.startswith(("worker", "coordinator")):
         return "ACTIVE"
     if low.startswith("owner"):
         return "HANDS" if "hands" in low else "DECISION"

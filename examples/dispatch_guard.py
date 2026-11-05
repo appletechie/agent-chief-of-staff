@@ -3,18 +3,72 @@
 
 Every external lookup is injected, so the guard is testable offline and works with any VCS host,
 issue tracker or agent runner. A lookup that fails becomes a warning, never a silent pass.
+
+Claims are written under an exclusive lock, and claim() refuses a name another session holds, so two sessions
+that both passed guard() at the same moment cannot both claim the same row: the second claim raises ClaimHeld.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
 CLAIM_TTL = timedelta(hours=6)
+LOCK_TIMEOUT = 20.0
+
+_local = threading.local()
+
+
+class LockTimeout(TimeoutError):
+    pass
+
+
+class ClaimHeld(RuntimeError):
+    pass
+
+
+@contextmanager
+def file_lock(path: Path, timeout: float = LOCK_TIMEOUT):
+    """Exclusive advisory lock, re-entrant per thread. Copied from ledger_store.file_lock to keep this file standalone."""
+    path = Path(path).resolve()
+    held = _local.__dict__.setdefault("held", {})
+    if path in held:
+        held[path] += 1
+        try:
+            yield
+        finally:
+            held[path] -= 1
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise LockTimeout(f"{path} held by {Path(path).read_text().strip() or 'unknown'}")
+                time.sleep(0.05)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"pid={os.getpid()}".encode())
+        held[path] = 1
+        try:
+            yield
+        finally:
+            del held[path]
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 @dataclass
@@ -41,6 +95,7 @@ class Claims:
 
     def __init__(self, path: Path):
         self.path = Path(path)
+        self.lock = self.path.with_suffix(".lock")
 
     def load(self) -> dict:
         return json.loads(self.path.read_text()) if self.path.exists() else {}
@@ -48,15 +103,23 @@ class Claims:
     def live(self, now: datetime) -> dict:
         return {k: v for k, v in self.load().items() if now - datetime.fromisoformat(v["at"]) < CLAIM_TTL}
 
-    def claim(self, names: Iterable[str], session: str, worker: str, now: datetime) -> None:
-        data = self.live(now)
-        for name in names:
-            data[name] = {"session": session, "worker": worker, "at": now.isoformat()}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=self.path.parent)
-        with os.fdopen(fd, "w") as fh:
-            json.dump(data, fh, indent=2)
-        os.replace(tmp, self.path)
+    def claim(self, names: Iterable[str], session: str, worker: str, now: datetime,
+              override: str | None = None) -> None:
+        """Claim every name or none. A name another session holds refuses unless override gives a reason."""
+        names = list(names)
+        with file_lock(self.lock):
+            data = self.live(now)
+            taken = [f"{n} (session {data[n]['session']})" for n in names
+                     if n in data and data[n]["session"] != session]
+            if taken and not (override and override.strip()):
+                raise ClaimHeld("already claimed: " + ", ".join(taken))
+            for name in names:
+                data[name] = {"session": session, "worker": worker, "at": now.isoformat()}
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent)
+            with os.fdopen(fd, "w") as fh:
+                json.dump(data, fh, indent=2)
+            os.replace(tmp, self.path)
 
 
 def guard(key: str | None, row: str, session: str, sources: Sources, claims: Claims,

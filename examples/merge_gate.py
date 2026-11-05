@@ -12,8 +12,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 GREEN = {"success", "skipped", "neutral"}
-# A required check must actually run and pass; skipped is green only for checks a repo doesn't require.
-REQUIRED_GREEN = {"success"}
+# A required check must actually run and pass (neutral passes, as on most VCS hosts); skipped is green only
+# for checks a repo doesn't require.
+REQUIRED_GREEN = {"success", "neutral"}
 VERDICT_LINE = re.compile(r"(?m)^\s*verdict:\s*(clean|findings)\s*$")
 PENDING = {"queued", "in_progress", "pending", "waiting", "requested"}
 # Row holds are the owner's words: an uppercase token or a fixed phrase, not any prose containing "held".
@@ -48,11 +49,13 @@ class Policy:
     deploys_on_merge: frozenset[str]
     clean_phrases: tuple[str, ...] = ("no major issues", "looks good to merge")
     finding_phrases: tuple[str, ...] = ("issue", "finding", "suggest", "bug", "p1", "p2")
-    # Checks each repo must report on the head SHA. A listed check that never reported means WAIT,
-    # and a listed check that was skipped is not green. Unlisted checks may be skipped (path filters).
+    # Checks each repo must report on the head SHA. A listed check that has not reported means WAIT, until
+    # check_wait after the last push, then REPORT (a renamed or path-filtered job must not stall the repo quietly).
+    # A listed check that was skipped is not green. Unlisted checks may be skipped (path filters).
     required_checks: dict[str, frozenset[str]] = field(default_factory=dict)
     merge_drafts: bool = False
     review_wait: timedelta = timedelta(minutes=45)
+    check_wait: timedelta = timedelta(minutes=30)
 
 
 @dataclass
@@ -100,6 +103,8 @@ def decide(pr: PR, row_text: str, policy: Policy, now: datetime | None = None) -
     required = policy.required_checks.get(pr.repo, frozenset())
     missing = sorted(required - set(states))
     if missing:
+        if now - pr.last_push_at >= policy.check_wait:
+            return Decision("REPORT", "required checks never reported: " + ", ".join(missing))
         return Decision("WAIT", "required checks not yet reported: " + ", ".join(missing))
     if any(s in PENDING for s in states.values()):
         return Decision("WAIT", "checks pending on head")
