@@ -305,7 +305,7 @@ try:
     _lease_res = "ok"
 except Exception as _e:
     _lease_res = type(_e).__name__
-chk("#H7 lease.epoch tolerates a corrupt snapshot","sessions-and-recovery.md", _lease_res == "ok", _lease_res)
+chk("#H7 lease.epoch refuses a corrupt snapshot cleanly","sessions-and-recovery.md", _lease_res == "LeaseError", _lease_res)
 _held_wg = R()/"wg.json"; _held_wg.write_text("{not json")
 try:
     _res = wg.run({"x": lambda: {"a": 1}}, _held_wg, persist=True, now=T0)
