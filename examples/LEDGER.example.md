@@ -2,7 +2,7 @@
 
 One line per open item: what happens next, who does it, what it waits on. History and proofs go in the
 tracker or `ledger/notes/<id>.md`. Ids are never reused. Closed rows move to `ledger/closed-YYYY-MM.md`
-with their proof.
+with their proof, through `close_row(row_id, kind, ref, text)` only.
 
 ## Open
 

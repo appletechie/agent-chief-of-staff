@@ -19,4 +19,4 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Run the example tests
         working-directory: examples
-        run: python -m unittest -v test_examples test_durability
+        run: python -m unittest discover -v -p 'test_*.py'

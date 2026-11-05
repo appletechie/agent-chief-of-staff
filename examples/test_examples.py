@@ -31,14 +31,14 @@ class LedgerTests(TempDir):
     def test_ids_are_never_reused_after_close(self):
         led = ls.Ledger(self.root)
         a = led.write_row(None, next="first")
-        led.close_row(a["id"], proof="merged abc1234")
+        led.close_row(a["id"], "merged", "abc1234", "first row merged")
         self.assertEqual(led.write_row(None, next="second")["id"], "R-002")
 
     def test_close_requires_proof(self):
         led = ls.Ledger(self.root)
         a = led.write_row(None, next="first")
         with self.assertRaises(ValueError):
-            led.close_row(a["id"], proof="  ")
+            led.close_row(a["id"], "merged", "  ", "no ref")
 
     def test_long_rows_spill_to_notes(self):
         led = ls.Ledger(self.root)

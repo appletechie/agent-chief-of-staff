@@ -49,7 +49,7 @@ A worker-owned row whose later step needs the owner stays ACTIVE, and the brief 
 
 ```
 write_row(row_id, fields)       # create or update, under state/ledger.lock
-close_row(row_id, proof)        # move to ledger/closed-YYYY-MM.md, proof required
+close_row(row_id, kind, ref, text)  # move to ledger/closed-YYYY-MM.md with structured proof
 next_free_id()                  # scans open + closed
 check()                         # structural checker, exit non-zero on error
 ```
@@ -72,25 +72,32 @@ A small deterministic script that fails loudly on:
 - a key cell that is not one key or `—`;
 - an empty next action;
 - an owner that is not a live worker, `owner`, or `coordinator` (with a live-agent lookup when available; skip the lookup offline rather than guessing);
-- a due cell that does not parse.
+- a due cell that does not parse;
+- an archived row whose proof is not `kind: ref - text` with a known kind and a ref that passes the kind's check (rows closed before you adopted structured proof can be left alone with `proof_since`).
 
 It warns, without failing, on over-budget rows and on rows without a key where your policy requires one (for example any worker-owned row, since the worker's branch and PR need it).
 
 ## Closing with proof
 
-A row closes only by moving to `ledger/closed-YYYY-MM.md` with a proof pointer the coordinator read itself. The archive line is written first, then the ledger line is removed. An id in both the ledger and the archive means a close crashed after the archive write: re-run the close or delete the ledger line; never re-append the archive line. Acceptable proofs:
+A row closes only by moving to `ledger/closed-YYYY-MM.md` with proof the coordinator read itself, and only through `close_row(row_id, kind, ref, text)`. `kind` says what sort of evidence it is, `ref` is the token someone can check later, and `text` says what it proves. The archive stores `kind: ref - text`; the full proof goes verbatim to the row's notes file first, because the archive is a table and rewrites pipes. The archive line is written next, then the ledger line is removed. An id in both the ledger and the archive means a close crashed after the archive write: re-run the close or delete the ledger line; never re-append the archive line.
 
-| claim | proof |
-|---|---|
-| Tests pass | The command, exit code 0 and the summary line with counts, from this run |
-| CI is green | The CI run id with `completed / success` **on the head commit SHA** you are merging or merged |
-| Merged | The merge commit SHA |
-| Deployed | Deploy id plus a fresh readiness check and one pass of the user flow that was broken |
-| Config changed | The setting read back after the write |
-| Message sent | The message or comment id from the API response |
-| Owner decided | The owner's words, verbatim, with the time |
+| kind | claim | the ref must carry |
+|---|---|---|
+| `tests` | Tests pass | The summary counts from this run (`Ran 88 tests ... OK`, `64/64`) or the CI run id |
+| `ci` | CI is green | The run id or head commit SHA, plus the conclusion `success`, **on the head SHA** you are merging or merged |
+| `merged` | Merged | The merge commit SHA, alone |
+| `deployed` | Deployed | The deploy or run id plus a live check status (`readyz 200`, `healthy`); the text names the user flow re-run |
+| `config` | Config changed | The setting read back after the write (`name=value`) |
+| `message` | Message sent | The message, comment or review id from the API response |
+| `owner` | Owner decided | The owner's words, in quotes, with the time |
+| `folded` | Same work as another row | The open row id it was folded into; that row must already mention this one |
+| `void` | Opened by mistake | The reason, naming the test or accident that created it |
+
+Refused before anything is written: a kind not in the table, an empty ref, a ref or text that is only a claim (`verified`, `ok`, `done`, `works`, `the worker said it works`), and a ref with nothing the kind can check (prose). `check()` applies the same rules to the archive, so a row moved by hand fails the checker.
 
 Not proof: a worker's "verified", a file's modification time, an HTTP 200 on a page that might be an error page, a watcher process that exited 0, a CI run on a different commit, a cancelled or timed-out step.
+
+The structure makes a claim impossible to file as proof; it cannot make a well-formed ref true. For that, give the ledger a `can_close(row, proof)` policy that checks the ref against the outside world and returns a reason to refuse. `pr_merge_policy(lookup)` is one: a row that names a pull request (`owner/repo#N` or a pull URL) closes as `merged` only with that PR's merge commit SHA, read through the injected `lookup(repo, number)`; a lookup error refuses the close. Add your own for review state, issue state or a deploy's health. Structured proof follows the design in [#8](https://github.com/appletechie/agent-chief-of-staff/issues/8) by karutoil.
 
 If something cannot be checked, the row says "unconfirmed" and why. That is a valid state; a false "done" is not.
 

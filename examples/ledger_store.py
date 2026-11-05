@@ -9,6 +9,12 @@ Layout (relative to a root directory):
 
 Standard library only. Uses fcntl, so POSIX; swap file_lock() for another primitive elsewhere.
 
+Closing takes structured proof: close_row(row_id, kind, ref, text) with kind in PROOF_KINDS and a ref the kind can
+be checked against (a SHA, a run id, a comment id, a read-back, the owner's quoted words with the time). A claim
+("verified", "ok", "the worker said it works") or prose with no checkable token is refused, and check() fails any
+archived row whose proof cell is not `kind: ref - text`. An optional can_close(row, proof) policy (for example
+pr_merge_policy(lookup)) ties the proof to outside facts.
+
 Fencing: build the Ledger with fence=lease.fenced (a context manager that blocks takeovers and yields the lease's
 current epoch) and every write must pass expect_epoch; a stale epoch is refused. The fence is taken before the
 ledger lock and held for the whole write, so a takeover cannot land between the check and the write (see lease.py).
@@ -23,6 +29,7 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, ContextManager
@@ -38,6 +45,26 @@ DUE = re.compile(r"^(\d{2}-\d{2}(?: \d{2}:\d{2}Z)?|\d{4}-\d{2}-\d{2})$")
 QUEUES = ("ACTIVE", "DECISION", "HANDS", "PEOPLE", "TIME")
 LOCK_TIMEOUT = 20.0
 SPILL_ORDER = ("next", "waits")  # free-text cells cut to fit the budget; id, key and due are short by format
+PROOF_KINDS = ("tests", "ci", "merged", "deployed", "config", "message", "owner", "folded", "void")
+NOT_PROOF_WORDS = {"verified", "ok", "okay", "done", "works", "work", "worked", "working", "fine", "good", "confirmed",
+                   "green", "passed", "passing", "pass", "success", "successful", "lgtm", "complete", "completed",
+                   "fixed", "yes", "looks", "all", "it", "is", "the", "worker", "said", "says", "everything", "should",
+                   "now", "tested", "and", "be"}
+SHA = re.compile(r"\b[0-9a-f]{7,40}\b")
+RUN_ID = re.compile(r"\b\d{6,}\b")
+COUNTS = re.compile(r"\bRan \d+\b|\b\d+\s*(?:tests?|passed|passing|failed|failures|errors|skipped)\b|\b\d+\s*/\s*\d+\b"
+                    r"|\b\d+ OK\b|\bOK \(", re.I)
+CI_SUCCESS = re.compile(r"\bsuccess\b", re.I)
+LIVE_STATUS = re.compile(r"\b(?:[1-5]\d\d|healthy|success|passed|PASS)\b")
+ID_TOKEN = re.compile(r"(?<![\w.-])(?=[\w.-]*\d)[\w.-]{4,}(?![\w.-])")
+READ_BACK = re.compile(r"read[ -]?back|readback|\w\s*(?:==?|->|→)\s*\S", re.I)
+MESSAGE_ID = re.compile(r"\d{4,}")
+QUOTED = re.compile(r"[\"'“‘][^\"“”‘’]+?[\"'”’]")
+WHEN = re.compile(r"\b\d{1,2}:\d\d\b|\b\d{4}-\d\d-\d\d\b|\b\d\d-\d\d\b")
+VOID_REASON = re.compile(r"\b(?:tests?|testing|fixture|accident\w*|mistake\w*|in error|by error|typo|stray|created by)\b",
+                         re.I)
+PROOF_CELL = re.compile(r"^(?P<kind>[a-z]+): (?P<ref>.+?) - (?P<text>.+)$")
+PR_REF = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w-]*/[\w.-]+)#(\d+)\b|github\.com/([\w-]+/[\w.-]+)/pull/(\d+)")
 
 _local = threading.local()  # re-entrancy is per thread; other threads must really wait
 
@@ -46,8 +73,22 @@ class LockTimeout(RuntimeError):
     pass
 
 
+class ProofRefused(ValueError):
+    """The proof is not evidence: unknown kind, empty or prose-only ref, or a claim such as "verified" alone."""
+
+
 class CloseRefused(ValueError):
     """The supplied close policy rejected this row/proof pair (PR not merged, review still open, ...)."""
+
+
+@dataclass(frozen=True)
+class Proof:
+    kind: str
+    ref: str
+    text: str
+
+    def __str__(self) -> str:
+        return f"{self.kind}: {self.ref} - {self.text}"
 
 
 class StaleEpoch(RuntimeError):
@@ -94,8 +135,12 @@ def file_lock(path: Path, timeout: float = LOCK_TIMEOUT):
 class Ledger:
     def __init__(self, root: Path, fence: Callable[[], ContextManager[int]] | None = None,
                  require_key: Callable[[dict], bool] | None = None,
-                 can_close: Callable[[dict, str], str | None] | None = None):
-        """require_key(row) -> True where your policy needs an issue key, e.g. lambda r: r["owner"].startswith("worker-")."""
+                 can_close: Callable[[dict, Proof], str | None] | None = None,
+                 proof_since: datetime | None = None):
+        """require_key(row) -> True where your policy needs an issue key, e.g. lambda r: r["owner"].startswith("worker-").
+        can_close(row, proof) -> None to allow, else the reason to refuse (see pr_merge_policy).
+        proof_since: check() leaves archived rows closed before this time alone (set it to when you adopted
+        structured proof); None checks every archived row."""
         self.root = Path(root)
         self.path = self.root / "LEDGER.md"
         self.notes = self.root / "ledger" / "notes"
@@ -103,6 +148,7 @@ class Ledger:
         self.fence = fence
         self.require_key = require_key
         self.can_close = can_close
+        self.proof_since = proof_since
 
     @contextmanager
     def _fenced(self, expect_epoch: int | None):
@@ -134,14 +180,19 @@ class Ledger:
                 out.append(row)
         return out
 
-    def closed_ids(self) -> set[str]:
-        ids = set()
+    def closed_rows(self) -> list[dict]:
+        out = []
         for archive in sorted((self.root / "ledger").glob("closed-*.md")):
             for line in archive.read_text().splitlines():
                 cells = split(line)
                 if cells and ROW_ID.match(cells[0]):
-                    ids.add(cells[0])
-        return ids
+                    cells += [""] * (5 - len(cells))
+                    out.append({"id": cells[0], "key": cells[1], "closed": cells[2], "proof": cells[3],
+                                "_file": archive.name})
+        return out
+
+    def closed_ids(self) -> set[str]:
+        return {r["id"] for r in self.closed_rows()}
 
     def next_free_id(self) -> str:
         used = {r["id"] for r in self.rows()} | self.closed_ids()
@@ -174,20 +225,31 @@ class Ledger:
             atomic_write(self.path, "\n".join(lines) + "\n")
             return current
 
-    def close_row(self, row_id: str, proof: str, now: datetime | None = None, expect_epoch: int | None = None) -> str:
-        """Move a row to ledger/closed-YYYY-MM.md with its proof. Proof is mandatory.
+    def close_row(self, row_id: str, kind: str, ref: str, text: str, now: datetime | None = None,
+                  expect_epoch: int | None = None) -> str:
+        """Move a row to ledger/closed-YYYY-MM.md with structured proof (see PROOF_KINDS and proof_problem).
 
-        The archive line is written before the ledger line is removed. A crash between the two leaves the id in
-        both places, which check() reports; finish by re-running close_row or deleting the ledger line."""
-        if not proof or not proof.strip():
-            raise ValueError("a row closes only with proof")
+        Refused before anything is written: a proof that is not evidence (ProofRefused), a folded target that is not
+        an open row mentioning this one, or a can_close policy that says no (CloseRefused). The full proof goes to
+        the row's note verbatim, the archive line is written next, then the ledger line is removed. A crash between
+        the two leaves the id in both places, which check() reports; finish by re-running close_row or deleting the
+        ledger line."""
+        proof = Proof(kind, " ".join(str(ref or "").split()), " ".join(str(text or "").split()))
+        problem = proof_problem(proof.kind, proof.ref, proof.text)
+        if problem:
+            raise ProofRefused(f"{row_id} not closed: {problem}")
         now = now or datetime.now(timezone.utc)
         with self._fenced(expect_epoch), file_lock(self.lock):
             lines = self._lines()
-            match = [r for r in self.rows() if r["id"] == row_id]
+            rows = self.rows()
+            match = [r for r in rows if r["id"] == row_id]
             if not match:
                 raise KeyError(f"{row_id} is not open")
             row = match[0]
+            if kind == "folded":
+                reason = self._fold_problem(row_id, proof.ref, rows)
+                if reason:
+                    raise CloseRefused(reason)
             if self.can_close is not None:
                 reason = self.can_close(row, proof)
                 if reason:
@@ -199,12 +261,22 @@ class Ledger:
             # store the proof's full text in the row's note before the archive (a table) cuts or rewrites it.
             self.notes.mkdir(parents=True, exist_ok=True)
             with (self.notes / f"{row_id}.md").open("a") as note:
-                note.write("\n## proof\n" + str(proof) + "\n")
+                note.write(f"\n## proof\nkind: {kind}\nref: {ref}\n{text}\n")
             with archive.open("a") as fh:
-                fh.write(table_line([row_id, row["key"], f"{now:%Y-%m-%d %H:%MZ}", clean(proof), row["next"]]) + "\n")
+                fh.write(table_line([row_id, row["key"], f"{now:%Y-%m-%d %H:%MZ}", clean(str(proof)), row["next"]]) + "\n")
             del lines[row["_line"] - 1]
             atomic_write(self.path, "\n".join(lines) + "\n")
             return str(archive)
+
+    def _fold_problem(self, row_id: str, target: str, rows: list[dict]) -> str | None:
+        """A folded row's target must be another open row that already names it (in a cell or its note)."""
+        into = next((r for r in rows if r["id"] == target and r["id"] != row_id), None)
+        if into is None:
+            return f"folded target {target} is not another open row"
+        note = self.notes / f"{target}.md"
+        if not any(row_id in str(into[k]) for k in FIELDS) and not (note.exists() and row_id in note.read_text()):
+            return f"folded target {target} does not mention {row_id}; carry its open items there first"
+        return None
 
     def _spill(self, row: dict) -> dict:
         """Over budget: save the full text to the row's note, then cut next action, then waits on, until it fits.
@@ -259,7 +331,121 @@ class Ledger:
                 warnings.append(f"{where}: {row_chars(r)} chars, budget {ROW_BUDGET}")
             if self.require_key and r["key"] in NONE and self.require_key(r):
                 warnings.append(f"{where}: no issue key, and policy requires one for this row")
+        errors += self.closed_proof_errors()
         return errors, warnings
+
+    def closed_proof_errors(self) -> list[str]:
+        """Archived rows closed at or after proof_since (all, when None) must carry `kind: ref - text` proof."""
+        errors = []
+        for r in self.closed_rows():
+            where = f"{r['_file']} {r['id']}"
+            try:
+                when = datetime.strptime(r["closed"], "%Y-%m-%d %H:%MZ").replace(tzinfo=timezone.utc)
+            except ValueError:
+                when = None
+            if self.proof_since is not None and when is not None and when < self.proof_since:
+                continue
+            if when is None:
+                errors.append(f"{where}: closed time must be YYYY-MM-DD HH:MMZ")
+                continue
+            proof = parse_proof(r["proof"])
+            if proof is None:
+                errors.append(f"{where}: proof must be `kind: ref - text` (close rows only through close_row)")
+                continue
+            problem = proof_problem(proof.kind, proof.ref, proof.text)
+            if problem:
+                errors.append(f"{where}: {problem}")
+        return errors
+
+
+def not_proof(value: str) -> bool:
+    """True for a claim with nothing checkable in it: "verified", "ok", "done", "the worker said it works"."""
+    words = re.findall(r"[a-z']+", (value or "").lower().replace("'s", ""))
+    return not re.search(r"\d", value or "") and all(w in NOT_PROOF_WORDS for w in words)
+
+
+def proof_problem(kind: str, ref: str, text: str) -> str | None:
+    """None when (kind, ref, text) is structured proof, else why not. Static, so check() can re-run it on the
+    archive. The ref carries the checkable token; text says what it proves.
+
+    tests    counts ("Ran 88 tests ... OK", "64/64") or a CI run id
+    ci       a run id or head SHA plus the conclusion "success"
+    merged   the merge commit SHA, alone
+    deployed a deploy or run id plus a live check status ("readyz 200", "healthy")
+    config   the setting read back ("autoDeploy=false", "read back ...")
+    message  the message, comment or review id
+    owner    the owner's words in quotes, with the time
+    folded   the open row id it was folded into (that row must mention this one; close_row checks)
+    void     for a test or accidental row; the reason says which"""
+    ref, text = " ".join(str(ref or "").split()), " ".join(str(text or "").split())
+    if kind not in PROOF_KINDS:
+        return f"{kind!r} is not a proof kind: {', '.join(PROOF_KINDS)}"
+    if not ref:
+        return f"a {kind} proof needs a ref"
+    if not text:
+        return f"a {kind} proof needs a text saying what the ref proves"
+    if " - " in ref:
+        return "the ref must not contain ' - ' (it separates ref from text in the archive)"
+    if not_proof(ref) or not_proof(text):
+        return f"{ref if not_proof(ref) else text!r} is a claim, not proof"
+    if kind == "tests" and not (COUNTS.search(ref) or RUN_ID.search(ref)):
+        return "a tests proof needs the counts or a run id, not prose"
+    if kind == "ci" and not ((RUN_ID.search(ref) or SHA.search(ref)) and CI_SUCCESS.search(ref)):
+        return "a ci proof needs a run id or head SHA plus the conclusion (success)"
+    if kind == "merged" and not re.fullmatch(r"[0-9a-f]{7,40}", ref):
+        return "a merged proof is the merge commit SHA"
+    if kind == "deployed":
+        status = LIVE_STATUS.search(ref)
+        if not status or not ID_TOKEN.search(ref[:status.start()] + " " + ref[status.end():]):
+            return "a deployed proof needs a deploy or run id plus a live check status"
+    if kind == "config" and not READ_BACK.search(ref):
+        return "a config proof needs the setting read back (name=value)"
+    if kind == "message" and not MESSAGE_ID.search(ref):
+        return "a message proof needs the message, comment or review id"
+    if kind == "owner" and not (QUOTED.search(ref) and WHEN.search(ref)):
+        return "an owner proof needs the owner's quoted words and the time"
+    if kind == "folded" and not ROW_ID.match(ref):
+        return "a folded proof's ref is the open row id it was folded into"
+    if kind == "void" and not VOID_REASON.search(f"{ref} {text}"):
+        return "void is only for a test or accidental row; say which"
+    return None
+
+
+def parse_proof(cell: str) -> Proof | None:
+    m = PROOF_CELL.match((cell or "").strip())
+    return Proof(m["kind"], m["ref"], m["text"]) if m else None
+
+
+def pr_refs(text: str) -> list[tuple[str, int]]:
+    """Every GitHub PR named in text, as (owner/repo, number): owner/repo#N or a github.com pull URL."""
+    out = []
+    for m in PR_REF.finditer(text or ""):
+        pr = (m[1], int(m[2])) if m[1] else (m[3], int(m[4]))
+        if pr not in out:
+            out.append(pr)
+    return out
+
+
+def pr_merge_policy(lookup: Callable[[str, int], str | None]) -> Callable[[dict, Proof], str | None]:
+    """A can_close policy: a row whose cells name a PR closes as `merged` only with that PR's merge SHA.
+
+    lookup(repo, number) returns the merge commit SHA, or None when the PR is not merged; inject your VCS client
+    (for GitHub: `gh pr view N -R repo --json state,mergeCommit`). A lookup error refuses the close."""
+    def can_close(row: dict, proof: Proof) -> str | None:
+        prs = pr_refs(" ".join(str(row.get(k, "")) for k in FIELDS))
+        if proof.kind != "merged" or not prs:
+            return None
+        seen = []
+        for repo, number in prs:
+            try:
+                sha = lookup(repo, number)
+            except Exception as error:  # a broken lookup must not read as "allowed"
+                return f"cannot read {repo}#{number} ({error})"
+            if sha and sha.lower().startswith(proof.ref.lower()):
+                return None
+            seen.append(f"{repo}#{number} " + (f"merged {sha[:7]}" if sha else "not merged"))
+        return f"{proof.ref} is not the merge SHA of the row's PR ({'; '.join(seen)})"
+    return can_close
 
 
 def queue_of(row: dict) -> str:
@@ -331,6 +517,10 @@ if __name__ == "__main__":
         ledger.write_row(a["id"], owner="worker-7f3a2c")
         print(ledger.path.read_text())
         print("queues:", {r["id"]: queue_of(r) for r in ledger.rows()})
-        print("closed to:", ledger.close_row(b["id"], proof='owner: "A" 2026-01-16 14:02Z'))
+        try:
+            ledger.close_row(a["id"], "tests", "verified", "the worker said so")
+        except ProofRefused as refused:
+            print("refused:", refused)
+        print("closed to:", ledger.close_row(b["id"], "owner", '"A" 2026-01-16 14:02Z', "price A chosen"))
         print("next id:", ledger.next_free_id(), "(never reuses", b["id"] + ")")
         print("check:", ledger.check())

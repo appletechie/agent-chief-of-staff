@@ -15,7 +15,7 @@ class ProofPreservation(unittest.TestCase):
         led = ls.Ledger(root)
         row = led.write_row(None, next="fix")
         proof = "exit 0: `cargo test | tail -1` -> 1171 passed"
-        led.close_row(row["id"], proof=proof, now=T0)
+        led.close_row(row["id"], "tests", proof, "suite run on the head commit", now=T0)
         self.assertIn(proof, (root / "ledger" / "notes" / f"{row['id']}.md").read_text())
 
 
