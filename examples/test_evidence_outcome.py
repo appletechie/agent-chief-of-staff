@@ -79,6 +79,8 @@ class EvidenceOutcome(unittest.TestCase):
             ("tests", "pytest tests/test_errors.py: 12 passed", "suite on head"),
             ("tests", "go test ./errors/handler_test.go: 12 passed", "covers tests/test_cancelled.py"),
             ("tests", "test_failures 12 passed", "suite on head"),
+            ("deployed", "deploy-12345 https://example.com:443/health 200", "checkout flow passed"),
+            ("deployed", "deploy-12345 readyz 200 (latency 500 ms)", "checkout flow passed"),
         ]
         for kind, ref, text in good:
             with self.subTest(kind=kind, ref=ref):

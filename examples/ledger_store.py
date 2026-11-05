@@ -69,6 +69,8 @@ RED_COUNT = re.compile(r"(?<![\w.])[1-9]\d*\s*(?:failed|failures?|errors?)(?![\w
 NOTHING_RAN = re.compile(r"\bRan 0 tests?\b|(?<![\w.])0\s*(?:tests?|passed)\b", re.I)
 SOME_RAN = re.compile(r"\bRan [1-9]|(?<![\w.])[1-9]\d*\s*(?:tests?|passed|passing)\b|\bOK\b|(?<![\w.])(\d+)\s*/\s*\1\b", re.I)
 EXIT_CODE = re.compile(r"\bexit(?:\s+code)?\s*[:=]?\s*(-?\d+)", re.I)
+# a 3-digit live status, not a port (:443), part of a path or id, or a measurement (500 ms, 404 KB)
+HTTP_STATUS = re.compile(r"(?<![\w.:/-])([1-5]\d\d)(?![\w./:-]|\s*(?:ms|s|sec|secs|seconds|[kmg]i?b|bytes|%)(?![A-Za-z]))", re.I)
 PASS_RATIO = re.compile(r"(?<![\w.])(\d+)\s*/\s*(\d+)\s*(?:tests?|passed|passing|ok|green)\b", re.I)
 LIVE_STATUS = re.compile(r"(?<![\w.-])(?:[1-5]\d\d|healthy|success|passed|PASS)(?![\w-]|\.\w)")  # not inside an id
 ID_TOKEN = re.compile(r"(?<![\w.-])(?=[\w.-]*\d)[\w.-]{4,}(?![\w.-])")
@@ -490,7 +492,7 @@ def red_outcome(kind: str, ref: str, text: str) -> str | None:
         if NOTHING_RAN.search(ref) or (re.search(r"\bskipped\b", ref, re.I) and not SOME_RAN.search(ref)):
             return "a tests proof where no test ran proves nothing"
     if kind == "deployed":
-        bad = [m.group(0) for m in LIVE_STATUS.finditer(ref) if m.group(0).isdigit() and not 200 <= int(m.group(0)) < 400]
+        bad = [m.group(1) for m in HTTP_STATUS.finditer(ref) if not 200 <= int(m.group(1)) < 400]
         if bad:
             return f"a deployed proof's live check returned {bad[0]}; only a 2xx/3xx status closes"
     return None
