@@ -114,7 +114,7 @@ Run the tests:
 
 ```sh
 cd examples
-python3 -m unittest -v test_examples test_durability
+python3 -m unittest discover -v -p 'test_*.py'
 ```
 
 ## Minimal viable version

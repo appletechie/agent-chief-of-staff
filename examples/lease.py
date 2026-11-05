@@ -90,7 +90,15 @@ class Lease:
         self.lock = self.path.with_suffix(".lock")  # two simultaneous takes must not both get the same epoch
 
     def read(self) -> dict | None:
-        return json.loads(self.path.read_text()) if self.path.exists() else None
+        if not self.path.exists():
+            return None
+        try:
+            lease = json.loads(self.path.read_text())
+        except json.JSONDecodeError as error:
+            raise LeaseError(f"state file {self.path} is corrupt: {error.lineno}:{error.colno} {error.msg}; recover it before running the lease") from error
+        if not isinstance(lease, dict):
+            raise LeaseError(f"state file {self.path} is not an object (got {type(lease).__name__})")
+        return lease
 
     def _write(self, data: dict) -> dict:
         self.path.parent.mkdir(parents=True, exist_ok=True)

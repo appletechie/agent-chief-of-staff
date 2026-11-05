@@ -31,6 +31,10 @@ class LockTimeout(TimeoutError):
     pass
 
 
+class ClaimsCorrupt(RuntimeError):
+    """A corrupt claims file must not be mistaken for an empty one."""
+
+
 class ClaimHeld(RuntimeError):
     pass
 
@@ -77,6 +81,7 @@ class Sources:
     assignee: Callable[[str], str | None]              # key -> assignee login or None
     live_workers: Callable[[], Iterable[dict]]         # -> [{"id", "row", "key", "host"}] on every host
     allowed_assignees: frozenset = frozenset({"owner", "coordinator"})
+    recent_dispatches: Callable[[str], Iterable[dict]] = lambda key: ()  # key -> [{"key", "session", "at"}]
 
 
 @dataclass
@@ -98,7 +103,15 @@ class Claims:
         self.lock = self.path.with_suffix(".lock")
 
     def load(self) -> dict:
-        return json.loads(self.path.read_text()) if self.path.exists() else {}
+        if not self.path.exists():
+            return {}
+        try:
+            data = json.loads(self.path.read_text())
+        except json.JSONDecodeError as error:
+            raise ClaimsCorrupt(f"claims file {self.path} is corrupt: {error.msg}")
+        if not isinstance(data, dict):
+            raise ClaimsCorrupt(f"claims file {self.path} is not an object")
+        return data
 
     def live(self, now: datetime) -> dict:
         return {k: v for k, v in self.load().items() if now - datetime.fromisoformat(v["at"]) < CLAIM_TTL}
@@ -152,8 +165,26 @@ def guard(key: str | None, row: str, session: str, sources: Sources, claims: Cla
     except Exception as error:
         v.warnings.append(f"worker listing failed ({type(error).__name__})")
 
+    # dispatch.json catches the case where the claims expired: refuse a recent dispatch from another session,
+    # until the claims TTL would have caught it.
+    try:
+        cutoff = now - CLAIM_TTL
+        for dispatch in sources.recent_dispatches(key or ""):
+            if dispatch.get("session") == session:
+                continue
+            when = datetime.fromisoformat(dispatch["at"])
+            if when >= cutoff:
+                v.refusals.append(f"recent dispatch for {dispatch.get('key') or key} by session {dispatch.get('session')} at {dispatch['at']}")
+    except Exception as error:
+        v.warnings.append(f"recent dispatch lookup failed ({type(error).__name__})")
+
+    live_claims = {}
+    try:
+        live_claims = claims.live(now)
+    except ClaimsCorrupt as error:
+        v.refusals.append(f"claims file unreadable, cannot rule out a competing claim: {error}")
     for name in filter(None, (row, key)):
-        held = claims.live(now).get(name)
+        held = live_claims.get(name)
         if held and held["session"] != session:
             v.refusals.append(f"{name} claimed by session {held['session']} (worker {held['worker']}) at {held['at']}")
 
