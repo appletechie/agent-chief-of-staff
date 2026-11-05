@@ -124,7 +124,10 @@ def parse_due(text: str | None, now: datetime) -> tuple[datetime, str | None]:
             raise ValueError("no time zone")
         return due, None
     except (ValueError, OverflowError, TypeError):
-        return now + DEFAULT_DELAY, f"unreadable due {text!r}; defaulted to +60m"
+        try:
+            return now + DEFAULT_DELAY, f"unreadable due {text!r}; defaulted to +60m"
+        except OverflowError:  # now is within 60 min of datetime.max: the fallback itself must not raise (#25)
+            return now, f"unreadable due {text!r}; +60m is out of range, due now"
 
 
 def parse_wait(line: str, now: datetime) -> dict | None:
@@ -206,11 +209,11 @@ class Timers:
             yield
 
     def load(self) -> list[dict]:
-        if not self.path.exists():
-            return []
-        try:
+        try:  # not Path.exists(): it reads False under an unreadable directory, and that is not "no timers" (#25)
             timers = json.loads(self.path.read_text())
-        except (json.JSONDecodeError, OSError, UnicodeError) as error:
+        except FileNotFoundError:
+            return []
+        except (ValueError, OSError) as error:  # bad JSON, non-UTF-8, the int digit limit, unreadable
             raise TimersCorrupt(f"{self.path}: timers.json is corrupt: {error!s}") from error
         if not isinstance(timers, list):
             raise TimersCorrupt(f"{self.path}: expected an array of timer objects")

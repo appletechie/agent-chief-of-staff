@@ -140,11 +140,11 @@ class Claims:
         self.lock = self.path.with_suffix(".lock")
 
     def load(self) -> dict:
-        if not self.path.exists():
-            return {}
-        try:
+        try:  # not Path.exists(): it reads False under an unreadable directory, and that is not "no claims" (#25)
             data = json.loads(self.path.read_text())
-        except (json.JSONDecodeError, OSError, UnicodeError) as error:
+        except FileNotFoundError:
+            return {}
+        except (ValueError, OSError) as error:  # bad JSON, non-UTF-8, the int digit limit, unreadable
             raise ClaimsCorrupt(f"claims file {self.path} is corrupt: {str(error)}")
         if not isinstance(data, dict):
             raise ClaimsCorrupt(f"claims file {self.path} is not an object")
@@ -156,8 +156,15 @@ class Claims:
 
     def claim(self, names: Iterable[str], session: str, worker: str, now: datetime,
               override: str | None = None) -> None:
-        """Claim every name or none. A name another session holds refuses unless override gives a reason."""
+        """Claim every name or none. A name another session holds refuses unless override gives a reason. A blank
+        name, session or worker is refused before anything is written: claim_problem() would reject the record on
+        the next read and the name would stay blocked as an invalid claim (#25)."""
         names, now = list(names), clock(now)
+        if not names:
+            raise ValueError("a claim needs at least one row id or issue key")
+        for label, value in [*(("name", n) for n in names), ("session", session), ("worker", worker)]:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"claim {label} must be a non-empty string; nothing written")
         with file_lock(self.lock):
             data = self.live(now)
             taken = [f"{n} (invalid claim: {claim_problem(data[n])})" if claim_problem(data[n]) else

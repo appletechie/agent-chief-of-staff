@@ -148,7 +148,10 @@ def run(collectors: dict[str, Collector], state_path: Path, persist: bool, now: 
     now = clock(now)
     state_path = Path(state_path)
     try:
-        previous = json.loads(state_path.read_text()) if state_path.exists() else {}
+        try:
+            previous = json.loads(state_path.read_text())
+        except FileNotFoundError:
+            previous = {}
         if not isinstance(previous, dict):
             raise ValueError("snapshot is not an object")
     except (json.JSONDecodeError, ValueError, OSError, UnicodeError) as error:
