@@ -1,0 +1,470 @@
+[
+  {
+    "verdict": "PASS",
+    "claim": "ids are never reused across closed archives",
+    "source": "ledger.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "checker flags duplicate id, key, empty next, owner, due",
+    "source": "ledger.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "checker warns on a new row opened without a key",
+    "source": "ledger.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "a row over 500 chars spills and stays under budget",
+    "source": "ledger.md",
+    "note": "500 chars"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "long text spills to ledger/notes/<id>.md",
+    "source": "ledger.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "queue derives from owner AND waits-on",
+    "source": "ledger.md",
+    "note": "got DECISION (filed: #3 s5)"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "a row closes only with proof",
+    "source": "ledger.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "lock file records the holder",
+    "source": "ledger.md",
+    "note": "pid only, no script name"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "lock is re-entrant within a process",
+    "source": "ledger.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "a timer found in sending is failed, never resent",
+    "source": "waking.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "a due timer on a closed row is cancelled",
+    "source": "waking.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "lenient due parsing defaults and says so",
+    "source": "waking.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "timer ids are unique",
+    "source": "waking.md",
+    "note": [
+      "t-aaaaaa",
+      "t-bbbbbb"
+    ]
+  },
+  {
+    "verdict": "PASS",
+    "claim": "UNCHANGED when nothing moved",
+    "source": "waking.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "CHANGED when an item moves",
+    "source": "waking.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "an unreadable source is CHANGED",
+    "source": "waking.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "max_quiet forces a pass",
+    "source": "waking.md",
+    "note": "(filed: #3 s6, clock skew)"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "a companion (persist=False) leaves the snapshot alone",
+    "source": "waking.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: hold marker on the row -> REPORT",
+    "source": "merge-gate.md",
+    "note": "REPORT"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: hold marker in the PR -> REPORT",
+    "source": "merge-gate.md",
+    "note": "REPORT"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: draft PR -> REPORT",
+    "source": "merge-gate.md",
+    "note": "REPORT"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: not mergeable -> REPORT",
+    "source": "merge-gate.md",
+    "note": "REPORT"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: mergeability not computed -> WAIT",
+    "source": "merge-gate.md",
+    "note": "WAIT"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: check pending -> WAIT",
+    "source": "merge-gate.md",
+    "note": "WAIT"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: check failed -> REPORT",
+    "source": "merge-gate.md",
+    "note": "REPORT"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: check cancelled -> REPORT",
+    "source": "merge-gate.md",
+    "note": "REPORT"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: check timed out -> REPORT",
+    "source": "merge-gate.md",
+    "note": "REPORT"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: no receipt, already asked -> WAIT",
+    "source": "merge-gate.md",
+    "note": "WAIT"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: receipt says findings -> REPORT",
+    "source": "merge-gate.md",
+    "note": "REPORT"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: receipt unparseable -> REPORT",
+    "source": "merge-gate.md",
+    "note": "REPORT"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: unresolved threads -> REPORT",
+    "source": "merge-gate.md",
+    "note": "REPORT"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: repo deploys on merge -> REPORT",
+    "source": "merge-gate.md",
+    "note": "REPORT"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: all green -> MERGE",
+    "source": "merge-gate.md",
+    "note": "MERGE"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: required check missing inside check_wait -> WAIT",
+    "source": "merge-gate.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: required check missing past check_wait -> REPORT",
+    "source": "merge-gate.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: required check pending -> WAIT",
+    "source": "merge-gate.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: required check skipped -> REPORT",
+    "source": "merge-gate.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "decision table: required check neutral -> MERGE",
+    "source": "merge-gate.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "an expired lease is flagged",
+    "source": "sessions-and-recovery.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "only the holder renews",
+    "source": "sessions-and-recovery.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "a takeover needs a reason",
+    "source": "sessions-and-recovery.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "a non-primary cannot write the ledger",
+    "source": "sessions-and-recovery.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "an open PR naming the key refuses",
+    "source": "dispatch.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "an outside assignee refuses",
+    "source": "dispatch.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "a live worker on the row refuses",
+    "source": "dispatch.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "a failed lookup is a warning, not a pass",
+    "source": "dispatch.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "allow-duplicate without a reason raises",
+    "source": "dispatch.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "20 concurrent timer adds all survive",
+    "source": "waking.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "3 overlapping timer ticks deliver once",
+    "source": "waking.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "20 concurrent claims are all recorded",
+    "source": "dispatch.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "the claim itself is test-and-set",
+    "source": "dispatch.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "a takeover increments the epoch",
+    "source": "sessions-and-recovery.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "a stale epoch is refused",
+    "source": "sessions-and-recovery.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "a stale snapshot save is refused",
+    "source": "waking.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "#1.1 a clean phrase does not hide a finding",
+    "source": "merge-gate.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "#1.1 a clean receipt still reads clean",
+    "source": "merge-gate.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "#1.1 an unparseable receipt is not clean",
+    "source": "merge-gate.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "#1.4 the check-by is not eaten when the ref is omitted",
+    "source": "waking.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "#3.6 a timer keeps retrying inside RETRY_WINDOW",
+    "source": "waking.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "#6.1 a takeover waits for a write already past the check",
+    "source": "sessions-and-recovery.md",
+    "note": {
+      "take blocked": true,
+      "take": {
+        "epoch": 2
+      },
+      "write": {
+        "id": "R-001"
+      }
+    }
+  },
+  {
+    "verdict": "PASS",
+    "claim": "#6.1 a stale write after the take is refused",
+    "source": "sessions-and-recovery.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "#6.1b a takeover waits for a snapshot save in flight",
+    "source": "waking.md",
+    "note": {
+      "take blocked": true,
+      "take": {
+        "epoch": 2
+      },
+      "save": {
+        "ok": true
+      }
+    }
+  },
+  {
+    "verdict": "PASS",
+    "claim": "#6.2 an epoch is never silently ignored",
+    "source": "ledger.md",
+    "note": ""
+  },
+  {
+    "verdict": "PASS",
+    "claim": "#6.4 the spill keeps a later then-owner step",
+    "source": "ledger.md",
+    "note": ""
+  },
+  {
+    "verdict": "FAIL",
+    "claim": "#8.1 a close refuses a bare prose proof",
+    "source": "ledger.md",
+    "note": "closed"
+  },
+  {
+    "verdict": "PASS",
+    "claim": "#8.1 a close refuses an empty proof too",
+    "source": "ledger.md",
+    "note": ""
+  },
+  {
+    "verdict": "FAIL",
+    "claim": "#8.2 a receipt with findings under a clean token is not clean",
+    "source": "merge-gate.md",
+    "note": ""
+  },
+  {
+    "verdict": "FAIL",
+    "claim": "#8.2b a verdict inside a fenced example is ignored",
+    "source": "merge-gate.md",
+    "note": ""
+  },
+  {
+    "verdict": "FAIL",
+    "claim": "#8.3 an unreadable snapshot still produces a pass",
+    "source": "waking.md",
+    "note": "JSONDecodeError"
+  },
+  {
+    "verdict": "FAIL",
+    "claim": "#8.4 the archived proof is verbatim",
+    "source": "ledger.md",
+    "note": "exit 0: `cargo test / tail -1` -> 1171 passed"
+  },
+  {
+    "verdict": "FAIL",
+    "claim": "#8.5 the id redraw always terminates",
+    "source": "waking.md",
+    "note": "spins against a constant RNG"
+  },
+  {
+    "verdict": "FAIL",
+    "claim": "#8.6 an expired claim with a recent dispatch record still refuses",
+    "source": "dispatch.md",
+    "note": [
+      "open_prs_naming",
+      "assignee",
+      "live_workers",
+      "allowed_assignees"
+    ]
+  },
+  {
+    "verdict": "FAIL",
+    "claim": "#H7 lease.epoch tolerates a corrupt snapshot",
+    "source": "sessions-and-recovery.md",
+    "note": "JSONDecodeError"
+  },
+  {
+    "verdict": "FAIL",
+    "claim": "#H1 wake gate tolerates a corrupt snapshot",
+    "source": "waking.md",
+    "note": "JSONDecodeError"
+  }
+]

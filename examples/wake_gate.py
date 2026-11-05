@@ -69,6 +69,9 @@ def evaluate(collectors: dict[str, Collector], previous: dict, now: datetime,
         if bits:
             shown = ", ".join(bits[:8]) + (f" (+{len(bits) - 8} more)" if len(bits) > 8 else "")
             lines.append(f"{name}: {shown}")
+    lines = lines or []
+    if "__unreadable__" in previous:
+        lines.append(f"previous snapshot unreadable: {previous['__unreadable__']}")
     last_pass = previous.get("last_changed_at")
     if last_pass and datetime.fromisoformat(last_pass) > now:
         lines.append(f"last pass {last_pass} is in the future; forcing a pass")
@@ -93,7 +96,12 @@ def run(collectors: dict[str, Collector], state_path: Path, persist: bool, now: 
         raise ValueError("expect_epoch passed but no fence is configured; the save would not be fenced")
     now = now or datetime.now(timezone.utc)
     state_path = Path(state_path)
-    previous = json.loads(state_path.read_text()) if state_path.exists() else {}
+    try:
+        previous = json.loads(state_path.read_text()) if state_path.exists() else {}
+        if not isinstance(previous, dict):
+            raise ValueError("snapshot is not an object")
+    except (json.JSONDecodeError, ValueError) as error:
+        previous = {"__unreadable__": str(error)}   # marks the previous snapshot unavailable; saves a fresh one
     result = evaluate(collectors, previous, now, **kwargs)
     if persist:
         with fence() if fence is not None else nullcontext(expect_epoch) as current:

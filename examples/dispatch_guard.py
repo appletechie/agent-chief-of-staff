@@ -31,6 +31,10 @@ class LockTimeout(TimeoutError):
     pass
 
 
+class ClaimsCorrupt(RuntimeError):
+    """A corrupt claims file must not be mistaken for an empty one."""
+
+
 class ClaimHeld(RuntimeError):
     pass
 
@@ -98,7 +102,15 @@ class Claims:
         self.lock = self.path.with_suffix(".lock")
 
     def load(self) -> dict:
-        return json.loads(self.path.read_text()) if self.path.exists() else {}
+        if not self.path.exists():
+            return {}
+        try:
+            data = json.loads(self.path.read_text())
+        except json.JSONDecodeError as error:
+            raise ClaimsCorrupt(f"claims file {self.path} is corrupt: {error.msg}")
+        if not isinstance(data, dict):
+            raise ClaimsCorrupt(f"claims file {self.path} is not an object")
+        return data
 
     def live(self, now: datetime) -> dict:
         return {k: v for k, v in self.load().items() if now - datetime.fromisoformat(v["at"]) < CLAIM_TTL}
@@ -152,8 +164,13 @@ def guard(key: str | None, row: str, session: str, sources: Sources, claims: Cla
     except Exception as error:
         v.warnings.append(f"worker listing failed ({type(error).__name__})")
 
+    live_claims = {}
+    try:
+        live_claims = claims.live(now)
+    except ClaimsCorrupt as error:
+        v.refusals.append(f"claims file unreadable, cannot rule out a competing claim: {error}")
     for name in filter(None, (row, key)):
-        held = claims.live(now).get(name)
+        held = live_claims.get(name)
         if held and held["session"] != session:
             v.refusals.append(f"{name} claimed by session {held['session']} (worker {held['worker']}) at {held['at']}")
 
