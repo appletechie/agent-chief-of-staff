@@ -113,3 +113,23 @@ class TimerPayloadTests(unittest.TestCase):
             path.write_text(json.dumps([rec]))
             with self.assertRaises(tm.TimersCorrupt):
                 tm.Timers(path).load()
+
+
+class TimerClockTests(unittest.TestCase):
+    def test_naive_now_is_refused_and_cannot_poison_the_store(self):
+        root = pathlib.Path(tempfile.mkdtemp())
+        path = root/"timers.json"
+        with self.assertRaises(ValueError):
+            tm.Timers(path).add("R-001", "+5m", "x", "p", now=datetime.now())
+        self.assertFalse(path.exists())
+
+    def test_naive_now_cannot_be_used_for_ticking(self):
+        root = pathlib.Path(tempfile.mkdtemp())
+        store = tm.Timers(root/"timers.json")
+        store.add("R-001", "+1m", "x", "p", now=T0)
+        with self.assertRaises(ValueError):
+            store.tick(lambda t, text: "ok", {"R-001"}, now=datetime.now())
+
+    def test_naive_source_clock_does_not_fallback_silently(self):
+        with self.assertRaises(ValueError):
+            tm.parse_wait("WAIT ci org/app#88 +45m", datetime.now())

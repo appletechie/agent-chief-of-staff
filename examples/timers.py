@@ -45,6 +45,12 @@ from typing import Callable, ContextManager
 RETRY_WINDOW = timedelta(hours=4)  # retry send errors this long after the first attempt, then fail
 LOCK_TIMEOUT = 20.0
 DEFAULT_DELAY = timedelta(minutes=60)
+
+def aware(now: datetime) -> datetime:
+    """A coordinator must never create or compare a naive timestamp. Reject at the boundary."""
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("timers need an aware UTC time (datetime.now(timezone.utc), not datetime.now())")
+    return now
 WAIT_LINE = re.compile(r"^\s*WAIT\b\s*(?P<kind>\S+)?\s*(?P<ref>\S+)?\s*(?P<check_by>.+)?$")
 KINDS = {"ci", "review", "deploy", "render", "date", "person", "other"}
 
