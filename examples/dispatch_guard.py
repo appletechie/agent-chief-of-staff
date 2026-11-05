@@ -144,7 +144,7 @@ class Claims:
             return {}
         try:
             data = json.loads(self.path.read_text())
-        except (json.JSONDecodeError, OSError, UnicodeError) as error:
+        except (json.JSONDecodeError, OSError, UnicodeError, ValueError) as error:
             raise ClaimsCorrupt(f"claims file {self.path} is corrupt: {str(error)}")
         if not isinstance(data, dict):
             raise ClaimsCorrupt(f"claims file {self.path} is not an object")
@@ -158,6 +158,12 @@ class Claims:
               override: str | None = None) -> None:
         """Claim every name or none. A name another session holds refuses unless override gives a reason."""
         names, now = list(names), clock(now)
+        for name in names:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("a claim needs a non-empty row id or issue key")
+        for label, value in (("session", session), ("worker", worker)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"claim {label} must be non-empty")
         with file_lock(self.lock):
             data = self.live(now)
             taken = [f"{n} (invalid claim: {claim_problem(data[n])})" if claim_problem(data[n]) else

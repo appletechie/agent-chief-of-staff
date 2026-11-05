@@ -140,7 +140,7 @@ class Lease:
             return None
         try:
             lease = json.loads(self.path.read_text())
-        except (json.JSONDecodeError, OSError, UnicodeError) as error:
+        except (json.JSONDecodeError, OSError, UnicodeError, ValueError) as error:
             raise LeaseError(f"state file {self.path} is corrupt: {error!s}; recover it before running the lease") from error
         if not isinstance(lease, dict):
             raise LeaseError(f"state file {self.path} is not an object (got {type(lease).__name__})")
@@ -183,6 +183,8 @@ class Lease:
             yield self.epoch()
 
     def init(self, session_id: str, host: str, now: datetime | None = None) -> dict:
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise LeaseError("primary needs a non-empty session id")
         now = clock(now)
         with file_lock(self.lock):
             if self.read():
@@ -200,8 +202,10 @@ class Lease:
 
     def take(self, session_id: str, host: str, reason: str, now: datetime | None = None,
              force: bool = False) -> dict:
-        if not reason.strip():
+        if not isinstance(reason, str) or not reason.strip():
             raise LeaseError("a takeover needs a reason")
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise LeaseError("a takeover needs a non-empty destination session id")
         now = clock(now)
         with file_lock(self.lock):
             state = self.state(now)
@@ -220,6 +224,9 @@ def primary_gate(lease: Lease, job: str, log=print) -> int | None:
     """For a scheduled job: the epoch to pass as expect_epoch, or None to skip this run. A broken lease file is
     "not primary here": one log line, and the job does nothing (it never crashes, and never acts unfenced)."""
     try:
+        if lease.read() is None:
+            log(f"{job}: no primary lease is recorded; skipped (initialize the lease first)")
+            return None
         return lease.epoch()
     except LeaseError as error:
         log(f"{job}: not primary here; skipped ({error})")

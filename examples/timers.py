@@ -210,7 +210,7 @@ class Timers:
             return []
         try:
             timers = json.loads(self.path.read_text())
-        except (json.JSONDecodeError, OSError, UnicodeError) as error:
+        except (json.JSONDecodeError, OSError, UnicodeError, ValueError) as error:
             raise TimersCorrupt(f"{self.path}: timers.json is corrupt: {error!s}") from error
         if not isinstance(timers, list):
             raise TimersCorrupt(f"{self.path}: expected an array of timer objects")
