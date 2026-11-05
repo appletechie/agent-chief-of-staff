@@ -123,7 +123,7 @@ def parse_due(text: str | None, now: datetime) -> tuple[datetime, str | None]:
         if due.tzinfo is None:
             raise ValueError("no time zone")
         return due, None
-    except ValueError:
+    except (ValueError, OverflowError, TypeError):
         return now + DEFAULT_DELAY, f"unreadable due {text!r}; defaulted to +60m"
 
 
@@ -210,8 +210,8 @@ class Timers:
             return []
         try:
             timers = json.loads(self.path.read_text())
-        except json.JSONDecodeError as error:
-            raise TimersCorrupt(f"{self.path}: timers.json is corrupt (line {error.lineno} column {error.colno})") from error
+        except (json.JSONDecodeError, OSError, UnicodeError) as error:
+            raise TimersCorrupt(f"{self.path}: timers.json is corrupt: {error!s}") from error
         if not isinstance(timers, list):
             raise TimersCorrupt(f"{self.path}: expected an array of timer objects")
         return timers  # each record is checked by timer_problem() where it is used
@@ -226,6 +226,9 @@ class Timers:
     def add(self, row: str, due: str, name: str, prompt: str, target: str = "coordinator",
             owner: str = "coordinator", source: str = "cli", now: datetime | None = None,
             expect_epoch: int | None = None) -> dict:
+        for field, values in (("row", row), ("name", name), ("prompt", prompt), ("target", target)):
+            if not isinstance(values, str) or not values.strip():
+                raise ValueError(f"timer {field} must be non-empty; a blank value would make the record unreadable")
         now = clock(now)
         when, note = parse_due(due, now)
         with self._fenced(expect_epoch), file_lock(self.lock):
@@ -271,6 +274,17 @@ class Timers:
     def _tick(self, send, open_rows: set[str], now: datetime, expect_epoch: int | None) -> list[str]:
         with self._fenced(expect_epoch):
             timers, log, invalid = self.load(), [], set()
+            by_id = {}
+            for timer in timers:
+                if isinstance(timer, dict) and isinstance(timer.get("id"), str):
+                    by_id.setdefault(timer["id"], []).append(timer)
+            for tid, matches in by_id.items():
+                if len(matches) > 1:
+                    for record in matches:
+                        record["state"] = "failed"
+                        record["note"] = "duplicate timer id in the store; cannot prove it has not been delivered"
+                    log.append(f"{tid} ambiguous duplicate ids: not delivered")
+                    invalid |= {id(t) for t in matches}
             for index, t in enumerate(timers):
                 problem = timer_problem(t)
                 if problem:

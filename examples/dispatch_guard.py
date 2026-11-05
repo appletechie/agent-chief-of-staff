@@ -183,9 +183,15 @@ def guard(key: str | None, row: str, session: str, sources: Sources, claims: Cla
     if key:
         try:
             for pr in sources.open_prs_naming(key):
+                try:
+                    ref = (pr["repo"], pr["number"], pr["author"])
+                except (KeyError, TypeError) as error:
+                    v.warnings.append(f"malformed PR record ({type(error).__name__}); continuing the search")
+                    continue
                 v.refusals.append(f"open PR {pr['repo']}#{pr['number']} by {pr['author']} names {key}")
         except Exception as error:
             v.warnings.append(f"PR search failed ({type(error).__name__}); duplicate PRs not ruled out")
+            v.refusals.append("duplicate PR search is incomplete; cannot prove no competing PR is open")
         try:
             who = sources.assignee(key)
             if who and who not in sources.allowed_assignees:
@@ -208,9 +214,13 @@ def guard(key: str | None, row: str, session: str, sources: Sources, claims: Cla
     try:
         cutoff = now - CLAIM_TTL
         for dispatch in sources.recent_dispatches(key or ""):
-            if dispatch.get("session") == session:
+            try:
+                if dispatch["session"] == session:
+                    continue
+                when = datetime.fromisoformat(dispatch["at"])
+            except (KeyError, TypeError, ValueError) as error:
+                v.warnings.append(f"malformed recent dispatch ({error}); continuing the lookup")
                 continue
-            when = datetime.fromisoformat(dispatch["at"])
             if when >= cutoff:
                 v.refusals.append(f"recent dispatch for {dispatch.get('key') or key} by session {dispatch.get('session')} at {dispatch['at']}")
     except Exception as error:

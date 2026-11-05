@@ -48,7 +48,7 @@ class PR:
 class Policy:
     deploys_on_merge: frozenset[str]
     clean_phrases: tuple[str, ...] = ("no major issues", "looks good to merge")
-    finding_phrases: tuple[str, ...] = ("issue", "finding", "suggest", "bug", "p1", "p2")
+    finding_phrases: tuple[str, ...] = ("issue", "finding", "suggest", "bug", "p0", "p1", "p2")
     # Checks each repo must report on the head SHA. A listed check that has not reported means WAIT, until
     # check_wait after the last push, then REPORT (a renamed or path-filtered job must not stall the repo quietly).
     # A listed check that was skipped is not green. Unlisted checks may be skipped (path filters).
@@ -73,7 +73,7 @@ def _verdict_lines(body: str) -> list[str]:
     """
     out, fence = [], False
     for line in body.splitlines():
-        if line.lstrip().startswith("```"):
+        if line.lstrip().startswith(("```", "~~~")):
             fence = not fence
             continue
         if not fence and (m := VERDICT_LINE.match(line)):

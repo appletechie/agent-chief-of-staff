@@ -54,7 +54,10 @@ SHA = re.compile(r"\b[0-9a-f]{7,40}\b")
 RUN_ID = re.compile(r"\b\d{6,}\b")
 COUNTS = re.compile(r"\bRan \d+\b|\b\d+\s*(?:tests?|passed|passing|failed|failures|errors|skipped)\b|\b\d+\s*/\s*\d+\b"
                     r"|\b\d+ OK\b|\bOK \(", re.I)
-CI_SUCCESS = re.compile(r"\bsuccess\b", re.I)
+CI_SUCCESS = re.compile(r"(?<![A-Za-z_-])(success|succeeded|passed|passed with( failures)?)(?![A-Za-z_-])", re.I)
+# Explicit failure words beat "success" elsewhere in the same evidence string (a cancelled step is not green).
+FAILURE = re.compile(r"(?i)(?<![A-Za-z_-])FAILED\b|\bERROR?:?\b|\bCANCELLED?\b|\bTIMED[ -]?OUT\b"
+                     r"|\b(?:[1-9]\d*\s+(?:fail(?:ed|ures)?|errors?))\b")
 LIVE_STATUS = re.compile(r"(?<![\w.-])(?:[1-5]\d\d|healthy|success|passed|PASS)(?![\w-]|\.\w)")  # not inside an id
 ID_TOKEN = re.compile(r"(?<![\w.-])(?=[\w.-]*\d)[\w.-]{4,}(?![\w.-])")
 READ_BACK = re.compile(r"read[ -]?back|readback|\w\s*(?:==?|->|→)\s*\S", re.I)
@@ -64,7 +67,7 @@ WHEN = re.compile(r"\b\d{1,2}:\d\d(?!\d)")  # a time of day, not a bare date
 VOID_REASON = re.compile(r"\b(?:tests?|testing|fixture|accident\w*|mistake\w*|in error|by error|typo|stray|created by)\b",
                          re.I)
 PROOF_CELL = re.compile(r"^(?P<kind>[a-z]+): (?P<ref>.+?) - (?P<text>.+)$")
-PR_REF = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w-]*/[\w.-]+)#(\d+)\b|github\.com/([\w-]+/[\w.-]+)/pull/(\d+)")
+PR_REF = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w-]*/[\w.-]+)#(\d+)\b|(?i:github\.com)/([\w-]+/[\w.-]+)/pull/(\d+)")
 
 _local = threading.local()  # re-entrancy is per thread; other threads must really wait
 
@@ -254,6 +257,13 @@ class Ledger:
                 reason = self.can_close(row, proof)
                 if reason:
                     raise CloseRefused(reason)
+            # After a crash between archive and removal, retry the same call must not append a second copy.
+            old_rows = self.closed_rows()
+            old = next((r for r in old_rows if r["id"] == row_id and r.get("proof") == str(proof)), None)
+            if old is not None:
+                del lines[row["_line"] - 1]
+                atomic_write(self.path, "\n".join(lines) + "\n")
+                return str(self.root / "ledger" / old["_file"])
             archive = self.root / "ledger" / f"closed-{now:%Y-%m}.md"
             archive.parent.mkdir(parents=True, exist_ok=True)
             if not archive.exists():
@@ -334,6 +344,10 @@ class Ledger:
             if self.require_key and r["key"] in NONE and self.require_key(r):
                 warnings.append(f"{where}: no issue key, and policy requires one for this row")
         errors += self.closed_proof_errors()
+        archived_ids = [r["id"] for r in self.closed_rows()]
+        dupe_archives = sorted({i for i in archived_ids if archived_ids.count(i) > 1})
+        for row_id in dupe_archives:
+            errors.append(f"closed archive repeats id {row_id}; retry of close_row must not append it again")
         return errors, warnings
 
     def closed_proof_errors(self) -> list[str]:
@@ -390,6 +404,8 @@ def proof_problem(kind: str, ref: str, text: str) -> str | None:
         return "the ref must not contain ' - ' (it separates ref from text in the archive)"
     if not_proof(ref) or not_proof(text):
         return f"{ref if not_proof(ref) else text!r} is a claim, not proof"
+    if FAILURE.search(f"{ref} {text}"):
+        return f"the proof reports a failure ({ref} {text}); a failed or cancelled check is not completed work"
     if kind == "tests" and not (COUNTS.search(ref) or RUN_ID.search(ref)):
         return "a tests proof needs the counts or a run id, not prose"
     if kind == "ci" and not ((RUN_ID.search(ref) or SHA.search(ref)) and CI_SUCCESS.search(ref)):
