@@ -81,6 +81,7 @@ class Sources:
     assignee: Callable[[str], str | None]              # key -> assignee login or None
     live_workers: Callable[[], Iterable[dict]]         # -> [{"id", "row", "key", "host"}] on every host
     allowed_assignees: frozenset = frozenset({"owner", "coordinator"})
+    recent_dispatches: Callable[[str], Iterable[dict]] = lambda key: ()  # key -> [{"key", "session", "at"}]
 
 
 @dataclass
@@ -163,6 +164,19 @@ def guard(key: str | None, row: str, session: str, sources: Sources, claims: Cla
                     v.refusals.append(f"live worker {w['id']} on {w.get('host', '?')} carries {w.get('row') or w.get('key')}")
     except Exception as error:
         v.warnings.append(f"worker listing failed ({type(error).__name__})")
+
+    # dispatch.json catches the case where the claims expired: refuse a recent dispatch from another session,
+    # until the claims TTL would have caught it.
+    try:
+        cutoff = now - CLAIM_TTL
+        for dispatch in sources.recent_dispatches(key or ""):
+            if dispatch.get("session") == session:
+                continue
+            when = datetime.fromisoformat(dispatch["at"])
+            if when >= cutoff:
+                v.refusals.append(f"recent dispatch for {dispatch.get('key') or key} by session {dispatch.get('session')} at {dispatch['at']}")
+    except Exception as error:
+        v.warnings.append(f"recent dispatch lookup failed ({type(error).__name__})")
 
     live_claims = {}
     try:
