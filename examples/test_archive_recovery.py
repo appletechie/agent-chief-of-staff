@@ -111,3 +111,23 @@ L.close_row("R-001","tests","run 123456","12 passed",now=datetime(2026,1,16,14,0
 
 if __name__ == "__main__":
     unittest.main()
+
+class ForwardReviewRegressionTests(unittest.TestCase):
+    def test_four_column_closed_row_needs_repair(self):
+        root=pathlib.Path(tempfile.mkdtemp())
+        ledger=ls.Ledger(root)
+        path=root/"ledger"/"closed-2026-01.md"
+        path.parent.mkdir(parents=True)
+        path.write_text("| id | key | closed | proof | last next action |\n|---|---|---|---|---|\n| R-001 | — | 2026-01-16 14:00Z | tests: run 123456 - 12 passed |\n")
+        with self.assertRaises(ls.ArchiveError): ledger.closed_rows()
+
+    def test_all_typed_assignments_not_only_the_first(self):
+        for kind,ref in [("tests","run 123456 exit_code=0; exit_code=2; 12 passed"),
+                         ("tests","run 123456 failure_count=0; failure_count=1; 12 passed"),
+                         ("ci","run 123456 success; green=0"),
+                         ("deployed","deploy-12345 readyz:200 health:503")]:
+            assert ls.proof_problem(kind,ref,"checks on head") is not None, (kind,ref)
+
+    def test_dates_and_true_flags_are_not_false_failures(self):
+        assert ls.proof_problem("tests","run 123456: 12 passed on 2026/01/16","12 tests passing") is None
+        assert ls.proof_problem("deployed","deploy-12345 healthy=true","live flow works") is None

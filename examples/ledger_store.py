@@ -207,7 +207,8 @@ class Ledger:
             for line in archive.read_text().splitlines():
                 cells = split(line)
                 if cells and ROW_ID.match(cells[0]):
-                    cells += [""] * (5 - len(cells))
+                    if len(cells) != 5:
+                        raise ArchiveError(f"{archive}: an incomplete {cells[0]} archive row must be repaired")
                     out.append({"id": cells[0], "key": cells[1], "closed": cells[2], "proof": cells[3],
                                 "_file": archive.name})
                 elif re.match(r"\s*(?:\|\s*){0,2}(?:[^|]*\|)?\s*R-\d{3,}\b", line) and not re.match(r"\s*\| id \|", line):
@@ -286,6 +287,10 @@ class Ledger:
             note_path.parent.mkdir(parents=True,exist_ok=True)
             note=f"## proof\nkind: {kind}\nref: {ref}\n{text}\n"
             prior=note_path.read_text() if note_path.exists() else ""
+            # A known partial proof block at the end is not an actual retry target: complete it, don't append again.
+            tail_start=prior.rfind("## proof")
+            if tail_start >= 0 and note.startswith(prior[tail_start:]) and prior[tail_start:] != note:
+                prior=prior[:tail_start]
             if not prior or note not in prior:
                 atomic_write(note_path, prior + ("" if prior.endswith("\n") or not prior else "\n")+note)
             del lines[row["_line"]-1]
@@ -463,21 +468,22 @@ def proof_problem(kind: str, ref: str, text: str) -> str | None:
 
 
 def _typed_red_tokens(kind: str, ref: str) -> str | None:
-    """Typed fields can undermine a green bare word; ignore zero-valued counters, not false flags."""
-    red_count = re.search(r"(?<![\w.])(?:exit(?:_code)?|failure_count|error_count|failed_count|error|failed|failures|errors)\s*(?:=|:)\s*(-?\d+)", ref, re.I)
-    if red_count and int(red_count.group(1)) != 0:
-        return f"{red_count.group(0)!r} reports a nonzero failure or exit count"
-    boolean = re.search(r"(?i)(?<![\w.-])(success|succeeded|healthy|passed|green|ok|conclusion|status)\s*(?:=|:)\s*"
-                        r"(false|off|failure|failed|failure_count|[1-5]\d\d)", ref)
-    if boolean and boolean.group(2).lower() in {"false", "off", "failure", "failed"}:
-        return f"{boolean.group(0)!r} explicitly says the outcome is not green"
-    assignment = re.search(r"(?i)(?<![\w.-])(?:conclusion|outcome|healthy)\s*(?:=|:)\s*([\w-]+)", ref)
-    if assignment and assignment.group(1).lower() not in {"healthy", "success", "succeeded", "passed", "green", "ok"}:
-        return f"{assignment.group(0)!r} is not a completed green outcome"
-    if re.search(r"(?i)(?<![\w.-])(success|succeeded|passed|healthy)\s*(?:=|:)\s*(?:0|no|not\S*)\b", ref):
-        return "an internal negative assignment defeats the positive word"
+    """All explicit field assignments must be good, not only the first one (review follow-up)."""
+    for red_count in re.finditer(r"(?<![\w.])(?:exit(?:_code)?|failure_count|error_count|failed_count|error|failed|failures|errors)\s*(?:=|:)\s*(-?\d+)", ref, re.I):
+        if red_count[1] != "0":
+            return f"{red_count[0]!r} reports a nonzero failure or exit count"
+    # No green assertion wins over a later red field.
+    for flag in re.finditer(r"(?i)\b(success|succeeded|healthy|passed|green|ok)\s*[=:]\s*(false|off|failure|failed|failing)\b", ref):
+        return f"{flag[0]!r} explicitly says the outcome is not green"
+    for flag in re.finditer(r"(?i)\b(success|succeeded|healthy|passed|green|ok)\s*[=:]\s*(?:0|no)\b", ref):
+        return f"{flag[0]!r} explicitly says not completed"
+    for assignment in re.finditer(r"(?i)\b(conclusion|outcome)\s*[=:]\s*([\w-]+)", ref):
+        good = {"success", "succeeded", "passed", "green", "ok", "neutral"}
+        if assignment[2].lower() in {"true", "yes", "1"}:
+            continue
+        if assignment[2].lower() not in good:
+            return f"{assignment[0]!r} is not a completed outcome"
     return None
-
 
 def red_outcome(kind: str, ref: str, text: str) -> str | None:
     """Why tests/ci/deployed evidence is red, or None. Both the ref and the outcome shape are checked."""
@@ -496,22 +502,25 @@ def red_outcome(kind: str, ref: str, text: str) -> str | None:
     if code and int(code.group(1)) != 0:
         return f"a {kind} proof's exit code is {code.group(1)}, not 0"
     if kind == "tests":
-        for ratio in re.finditer(r"(?<![\w.])(\d+)\s*/\s*(\d+)(?:\s|$)", ref):
-            if int(ratio.group(1)) != int(ratio.group(2)) or int(ratio.group(2)) == 0:
-                return f"a tests proof of {ratio.group(1)}/{ratio.group(2)} is not every test actually passing"
+        ratio_scan = re.sub(r"\b\d{4}/\d{1,2}/\d{1,2}\b", " ", ref)
+        for sentence in re.split(r"\s*[;." "]+", ratio_scan):
+            for ratio in re.finditer(r"(?<![\w.])(\d+)\s*/\s*(\d+)(?:\s|$)", sentence):
+                if int(ratio.group(1)) != int(ratio.group(2)) or int(ratio.group(2)) == 0:
+                    return f"a tests proof of {ratio.group(1)}/{ratio.group(2)} is not every test actually passing"
         if NOTHING_RAN.search(ref):
             return "a tests proof where no test ran proves nothing"
         total = re.search(r"(?i)\bRan\s+(\d+)\s+tests?\b", ref)
-        skipped = re.search(r"(?i)skipped\s*[=:]\s*(\d+)", ref)
+        skipped = re.search(r"(?i)skipped\s*(?:=|:)?\s*(\d+)", ref)
+        tests_total = total or re.search(r"(?i)(\d+)\s+tests?\b", ref)
         if (re.search(r"(?i)\bskipped\b", ref) and not re.search(r"(?i)\b[1-9]\d*\s+(?:tests?|passed|passing)\b", ref)):
             return "a skipped test is not itself a passing test"
-        if total and skipped and int(total.group(1)) == int(skipped.group(1)):
+        if tests_total and skipped and int(tests_total.group(1)) == int(skipped.group(1)):
             return "every test in this proof was skipped"
     if kind == "deployed":
         bad = [m.group(1) for m in HTTP_STATUS.finditer(ref) if not 200 <= int(m.group(1)) < 400]
-        named = re.search(r"(?i)\b[\w./-]*(?:readyz|health|status)[\w./-]*\s*[:=]\s*([1-5]\d\d)(?!\d)", ref)
-        if named and not 200 <= int(named.group(1)) < 400:
-            bad.append(named.group(1))
+        for named in re.finditer(r"(?i)\b[\w./-]*(?:readyz|health|status)[\w./-]*\s*[:=]\s*([1-5]\d\d)(?!\d)", ref):
+            if not 200 <= int(named.group(1)) < 400:
+                bad.append(named.group(1))
         if bad:
             return f"a deployed proof's live check returned {bad[0]}; only a 2xx/3xx status closes"
     return None
