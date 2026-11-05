@@ -59,11 +59,13 @@ CI_SUCCESS = re.compile(r"\bsuccess\b", re.I)
 # ("0 failed", "failures=0", "no errors") are removed first, so a clean summary stays green.
 ZERO_RED = re.compile(r"(?<![\w.])0\s*(?:failed|failures?|errors?)(?![A-Za-z])|(?<![A-Za-z])(?:failed|failures?|errors?)\s*[=:]\s*0(?!\d)"
                       r"|\bno\s+(?:failures?|errors?|failed)(?![A-Za-z])", re.I)
-RED_OUTCOME = re.compile(r"(?<![A-Za-z])(?:fail(?:ed|ure|ures|ing|s)?|errors?|cancell?ed|canceled|timed[ _-]?out|timeout"
-                         r"|unhealthy)(?![A-Za-z])|\b(?:no|not|without)\s+(?:a\s+)?success|\bunsuccessful\b|\bnot\s+healthy\b"
+# Paths and file names (tests/test_errors.py) are identifiers, not outcomes: removed before the red-word check.
+PATH_LIKE = re.compile(r"[\w./-]*\.(?:py|js|jsx|ts|tsx|mjs|go|rs|rb|java|kt|swift|sh|c|cc|cpp|h|php|cs|exs?)\b")
+RED_OUTCOME = re.compile(r"(?<![\w-])(?:fail(?:ed|ure|ures|ing|s)?|errors?|cancell?ed|canceled|timed[ _-]?out|timeout"
+                         r"|unhealthy|startup_failure)(?![\w-])|\b(?:no|not|without)\s+(?:a\s+)?success|\bunsuccessful\b|\bnot\s+healthy\b"
                          r"|\brequired\b[^;,]*\bskipped\b|\bskipped\b[^;,]*\brequired\b", re.I)
-RED_COUNT = re.compile(r"(?<![\w.])[1-9]\d*\s*(?:failed|failures?|errors?)(?![A-Za-z])"
-                       r"|(?<![A-Za-z])(?:failed|failures?|errors?)\s*[=:]\s*[1-9]|\bFAILED\b")
+RED_COUNT = re.compile(r"(?<![\w.])[1-9]\d*\s*(?:failed|failures?|errors?)(?![\w-])"
+                       r"|(?<![\w-])(?:failed|failures?|errors?)\s*[=:]\s*[1-9]|\bFAILED\b")
 NOTHING_RAN = re.compile(r"\bRan 0 tests?\b|(?<![\w.])0\s*(?:tests?|passed)\b", re.I)
 SOME_RAN = re.compile(r"\bRan [1-9]|(?<![\w.])[1-9]\d*\s*(?:tests?|passed|passing)\b|\bOK\b|(?<![\w.])(\d+)\s*/\s*\1\b", re.I)
 EXIT_CODE = re.compile(r"\bexit(?:\s+code)?\s*[:=]?\s*(-?\d+)", re.I)
@@ -277,7 +279,8 @@ class Ledger:
                                    f"({archived[0]['proof']}); ids are never reused")
             # store the proof's full text in the row's note before the archive (a table) cuts or rewrites it.
             self.notes.mkdir(parents=True, exist_ok=True)
-            note_path, entry = self.notes / f"{row_id}.md", f"## proof\nkind: {proof.kind}\nref: {proof.ref}\n{proof.text}\n"
+            # the note keeps the caller's ref and text verbatim (whitespace and line breaks included)
+            note_path, entry = self.notes / f"{row_id}.md", f"## proof\nkind: {kind}\nref: {ref}\n{text}\n"
             if not (note_path.exists() and entry in note_path.read_text()):
                 with note_path.open("a") as note:
                     note.write("\n" + entry)
@@ -471,10 +474,10 @@ def red_outcome(kind: str, ref: str, text: str) -> str | None:
     status, unhealthy. The text describes, so only a nonzero failure count or a FAILED summary in it refuses."""
     if kind not in ("tests", "ci", "deployed"):
         return None
-    ref_red = RED_OUTCOME.search(ZERO_RED.sub(" ", ref))
+    ref_red = RED_OUTCOME.search(ZERO_RED.sub(" ", PATH_LIKE.sub(" ", ref)))
     if ref_red:
         return f"the {kind} proof reports {ref_red.group(0)!r}; a failed, cancelled or timed-out run is not done work"
-    text_red = RED_COUNT.search(ZERO_RED.sub(" ", text))
+    text_red = RED_COUNT.search(ZERO_RED.sub(" ", PATH_LIKE.sub(" ", text)))
     if text_red:
         return f"the {kind} proof's text reports {text_red.group(0)!r}; a failed run is not done work"
     if kind == "tests":

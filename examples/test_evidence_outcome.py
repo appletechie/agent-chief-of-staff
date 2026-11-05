@@ -55,6 +55,8 @@ class EvidenceOutcome(unittest.TestCase):
             ("ci", "run 123456 conclusion=startup_failure, success on abc1234", "CI report"),
             ("ci", "run 123456 success, required check e2e skipped", "CI report"),
             ("ci", "run 123456: conclusion=success2", "run failed before success"),
+            ("ci", "run 123456 conclusion=timed_out, success on lint", "CI report"),
+            ("tests", "pytest tests/test_x.py: 1 failed", "suite on head"),
             ("deployed", "deploy-12345 status 500", "live route returned an error"),
             ("deployed", "deploy-12345 status 503", "GET /readyz returned HTTP 503"),
             ("deployed", "deploy-12345 not healthy", "flow observed unavailable"),
@@ -74,6 +76,9 @@ class EvidenceOutcome(unittest.TestCase):
             ("ci", "run 123456 success on abc1234", "fixes the cancelled-timer bug"),
             ("deployed", "deploy-12345 status 200", "health and live flow passed"),
             ("deployed", "deploy-12345 status 301", "redirect to the new host"),
+            ("tests", "pytest tests/test_errors.py: 12 passed", "suite on head"),
+            ("tests", "go test ./errors/handler_test.go: 12 passed", "covers tests/test_cancelled.py"),
+            ("tests", "test_failures 12 passed", "suite on head"),
         ]
         for kind, ref, text in good:
             with self.subTest(kind=kind, ref=ref):
@@ -132,6 +137,13 @@ class ArchiveReplay(Temp):
         ledger.close_row(row["id"], "tests", "run 123456", "12 passed", now=T0)
         self.assertEqual((ledger.notes / f"{row['id']}.md").read_text().count("## proof"), 1)
         self.assertEqual(len(ledger.closed_rows()), 1)
+
+    def test_the_note_keeps_the_proof_verbatim(self):
+        ledger = ls.Ledger(self.root)
+        row = ledger.write_row(None, next="set the banner")
+        ref, text = 'banner="hello  world" read back', "output:\n  line one\n  line two"
+        ledger.close_row(row["id"], "config", ref, text, now=T0)
+        self.assertIn(f"ref: {ref}\n{text}\n", (ledger.notes / f"{row['id']}.md").read_text())
 
     def test_an_archived_id_with_other_proof_is_refused(self):
         ledger = ls.Ledger(self.root)
