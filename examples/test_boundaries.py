@@ -57,6 +57,14 @@ class RenderedText(unittest.TestCase):
             self.assertEqual(mg.decide(pr(body), "", mg.Policy(frozenset()), T0).action, "REPORT", body)
         self.assertEqual(mg.rendered("a `<b>x</b>` [y](z) <i>w</i>"), "a <b>x</b> y w")
 
+    def test_a_plain_text_title_and_escaped_markup_still_hold(self):
+        # Codex on #35: a title is plain text, and an escaped tag or comment displays literally.
+        held = mg.PR("org/app", 1, "<WIP> Parser", "", SHA, False, True, {"ci": "success"}, [mg.Review(SHA, "verdict: clean")], 0, T0)
+        self.assertEqual(mg.decide(held, "", mg.Policy(frozenset()), T0).action, "REPORT")
+        for body in ["\\<WIP> parser", "\\<!-- do not merge -->", "do \\*not\\* merge", "\\[on hold\\](x)"]:
+            self.assertEqual(mg.decide(pr(body), "", mg.Policy(frozenset()), T0).action, "REPORT", body)
+        self.assertEqual(mg.rendered("\\<b>x\\</b> \\*y\\* <i>z</i>"), "<b>x</b> y z")
+
     def test_three_space_closer_still_closes(self):
         p = pr(review="Example:\n```text\nexample\n   ```\nverdict: clean")
         self.assertEqual(mg.decide(p, "", mg.Policy(frozenset()), T0).action, "MERGE")

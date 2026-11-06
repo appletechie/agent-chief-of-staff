@@ -168,16 +168,22 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
     return "clean" if clean else "unparsed"
 
 
+def _prose(text: str) -> str:
+    """Rendered prose: an escaped character shows as itself (`\\<WIP>` displays `<WIP>`, Codex on #35), so escapes
+    are set aside while link labels lose their destinations and HTML tags and comments go; then emphasis marks go,
+    escaped ones too (`do \\*not\\* merge` still reads as a hold)."""
+    text = MD_ESCAPE.sub(lambda m: chr(0xF0000 + ord(m.group(1))), text)
+    text = HTML_TAG.sub("", MD_AUTOLINK.sub(r"\1", MD_LINK.sub(r"\1", text)))
+    return MD_MARKS.sub("", re.sub("[\U000F0000-\U000F007F]", lambda m: chr(ord(m.group(0)) - 0xF0000), text))
+
+
 def _rendered_prose(text: str) -> str:
-    """Prose outside code: link labels without destinations, HTML tags and comments dropped, escapes undone, emphasis
-    marks dropped. Inline code spans keep their contents as they are and lose only the backticks."""
+    """Prose outside code blocks; an inline code span keeps its contents as they are and loses only the backticks."""
     out, at = [], 0
     for span in CODE_SPAN.finditer(text):
-        prose = HTML_TAG.sub("", MD_AUTOLINK.sub(r"\1", MD_LINK.sub(r"\1", text[at:span.start()])))
-        out += [MD_MARKS.sub("", MD_ESCAPE.sub(r"\1", prose)), span.group(2)]
+        out += [_prose(text[at:span.start()]), span.group(2)]
         at = span.end()
-    prose = HTML_TAG.sub("", MD_AUTOLINK.sub(r"\1", MD_LINK.sub(r"\1", text[at:])))
-    return "".join(out + [MD_MARKS.sub("", MD_ESCAPE.sub(r"\1", prose))])
+    return "".join(out + [_prose(text[at:])])
 
 
 def rendered(text: str) -> str:
@@ -233,8 +239,9 @@ def decide(pr: PR, row_text: str, policy: Policy, now: datetime | None = None) -
     now = now or datetime.now(timezone.utc)
     if ROW_HOLD.search(row_text or ""):
         return Decision("REPORT", "row is on hold")
-    # a paragraph's line break renders as a space: "do not\nmerge" is a hold
-    if PR_HOLD.search(" ".join(rendered(f"{pr.title}\n{pr.body}").split())):
+    # a paragraph's line break renders as a space: "do not\nmerge" is a hold. A title shows as plain text (a
+    # "<WIP> Parser" title is a visible hold, Codex on #35), so it is read both as written and rendered.
+    if PR_HOLD.search(" ".join(rendered(f"{pr.title}\n{pr.body}").split())) or PR_HOLD.search(pr.title or ""):
         return Decision("REPORT", "PR title or body carries a hold marker")
     if pr.is_draft and not policy.merge_drafts:
         return Decision("REPORT", "PR is a draft")
