@@ -611,12 +611,9 @@ def compose_close_policies(*policies: Callable[[dict, Proof], str | None] | None
     return can_close
 
 
-def pr_merge_policy(lookup: Callable[[str, int], str | None]) -> Callable[[dict, Proof], str | None]:
-    """A can_close policy: a row whose cells name a PR closes as `merged` only with that PR's merge SHA.
-
-    lookup(repo, number) returns the merge commit SHA, or None when the PR is not merged; inject your VCS client
-    (for GitHub: `gh pr view N -R repo --json state,mergeCommit`). A lookup error refuses the close."""
-    def can_close(row: dict, proof: Proof) -> str | None:
+def pr_merge_policy(lookup):
+    """A ticket with multiple PRs is closed only if **every** PR has the claimed merge SHA."""
+    def can_close(row, proof):
         prs = pr_refs(" ".join(str(row.get(k, "")) for k in FIELDS))
         if proof.kind != "merged" or not prs:
             return None
@@ -624,12 +621,12 @@ def pr_merge_policy(lookup: Callable[[str, int], str | None]) -> Callable[[dict,
         for repo, number in prs:
             try:
                 sha = lookup(repo, number)
-            except Exception as error:  # a broken lookup must not read as "allowed"
+            except Exception as error:
                 return f"cannot read {repo}#{number} ({error})"
-            if sha and sha.lower().startswith(proof.ref.lower()):
-                return None
             seen.append(f"{repo}#{number} " + (f"merged {sha[:7]}" if sha else "not merged"))
-        return f"{proof.ref} is not the merge SHA of the row's PR ({'; '.join(seen)})"
+            if not sha or not sha.lower().startswith(proof.ref.lower()):
+                return f"{proof.ref} is not the merge SHA of the row's PR ({'; '.join(seen)})"
+        return None
     return can_close
 
 
@@ -664,7 +661,8 @@ def table_line(cells) -> str:
 
 
 def clean(value) -> str:
-    return str(value).replace("|", "/").replace("\n", " ").strip()
+    # Python splitlines() recognizes more than LF. A Unicode separator cannot become an invisible ledger row (#33).
+    return re.sub(r"[\r\v\f\u0085\u2028\u2029\n]", " ", str(value)).replace("|", "/").strip()
 
 
 def row_chars(row: dict) -> int:
@@ -683,6 +681,8 @@ def cut_waits(text: str, over: int, pointer: str) -> str:
         return text
     i = max(cuttable, key=lambda j: len(clauses[j]))
     clauses[i] = cut(clauses[i], over, pointer)
+    if len(";".join(clauses)) == len(text) and over > 0:
+        return clauses[0].strip() + pointer
     return ";".join(clauses)
 
 

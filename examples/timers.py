@@ -140,6 +140,10 @@ def parse_wait(line: str, now: datetime) -> dict | None:
     if kind not in KINDS:
         kind = "other"
     ref, when = m.group("ref") or "", m.group("check_by")
+    if when is None and not ref:
+        first_token = m.group("kind")
+        if first_token and parse_due(first_token, now)[1] is None:
+            when = first_token
     # "WAIT ci +45m": with the ref omitted, the time lands in the ref slot. If it parses as a time, it is one.
     if when is None and ref and parse_due(ref, now)[1] is None:
         ref, when = "", ref
@@ -310,6 +314,16 @@ class Timers:
                 receipt, error = None, caught
             with self._fenced(expect_epoch):  # taken over mid-send: record nothing, leave it `sending`
                 if error is not None:
+                    # A counter can get close to Python's 4,300-digit integer conversion limit. Check before
+                    # prodding it over: a huge unreadable one must not kill this or future tick deliveries.
+                    try:
+                        str(int(t.get("attempts", 0)) + 1)
+                    except (TypeError, ValueError, OverflowError) as counter_error:
+                        t["attempts"], t["state"] = 0, "failed"
+                        t["note"] = f"counter overflow, not retried: {type(counter_error).__name__}"
+                        log.append(f"{t['id']} overflowed the counter; not retried")
+                        self.save(timers)
+                        continue
                     t["attempts"] = t.get("attempts", 0) + 1
                     expired = now - aware(t["first_attempt_at"]) >= RETRY_WINDOW
                     t["state"] = "failed" if expired else "armed"

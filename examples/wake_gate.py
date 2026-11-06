@@ -76,6 +76,9 @@ def check_snapshot(previous) -> tuple[dict, list[str]]:
         problems.append(f"previous snapshot part(s) {', '.join(bad[:8])} not an object; forcing a pass")
         parts = {name: items for name, items in parts.items() if isinstance(items, dict)}
     previous["parts"] = parts
+    if "last_changed_at" in previous and previous["last_changed_at"] is None:
+        problems.append("previous snapshot carries a null last_changed_at; forcing a pass")
+        del previous["last_changed_at"]
     stamp = previous.get("last_changed_at")
     if stamp is not None and aware(stamp) is None:
         problems.append(f"previous snapshot last_changed_at {str(stamp)[:40]!r} is not an ISO 8601 time with a time zone; "

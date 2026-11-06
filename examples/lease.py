@@ -84,6 +84,8 @@ def lease_problem(lease: dict) -> str | None:
         return f"'host' is {type(lease['host']).__name__}, not a string"
     if not whole(lease.get("ttl_s")):
         return f"'ttl_s' {str(lease.get('ttl_s'))[:40]!r} is not a whole number of seconds > 0"
+    if lease["ttl_s"] > 253402300799:
+        return "'ttl_s' exceeds every usable datetime interval"
     if "epoch" in lease and not whole(lease["epoch"]):
         return f"'epoch' {str(lease['epoch'])[:40]!r} is not a whole number >= 1"
     for name in ("renewed_at", "since"):
@@ -160,8 +162,11 @@ class Lease:
     def _write(self, data: dict) -> dict:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=self.path.parent)
-        with os.fdopen(fd, "w") as fh:
-            json.dump(data, fh, indent=2)
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(data, fh, indent=2)
+        except ValueError as error:
+            raise LeaseError(f"state field too large to serialize; the old lease is intact ({error!s})") from error
         os.replace(tmp, self.path)
         return data
 
@@ -195,6 +200,7 @@ class Lease:
 
     def init(self, session_id: str, host: str, now: datetime | None = None) -> dict:
         identity(session_id, "the primary's session id")
+        identity(host, "the primary's host")
         now = clock(now)
         with file_lock(self.lock):
             if self.read():
@@ -215,6 +221,7 @@ class Lease:
         if not isinstance(reason, str) or not reason.strip():
             raise LeaseError("a takeover needs a reason")
         identity(session_id, "the new primary's session id")
+        identity(host, "the new primary's host")
         now = clock(now)
         with file_lock(self.lock):
             state = self.state(now)
