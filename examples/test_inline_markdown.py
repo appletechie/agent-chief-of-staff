@@ -62,7 +62,13 @@ class InlineSpecCases(unittest.TestCase):
         ("<span>inline</span>", "inline", {}),
         ("<a href=\"x\">linked</a>", "linked", {}),
         ("<!-- comment --> text", " text", {}),
-        ("<!-->not a comment-->", "not a comment-->", {}),
+        # Ambiguous comment forms render LITERALLY (fail-closed: words stay visible), per cmark's grammar.
+        ("<!-->do not merge-->", "<!-->do not merge-->", {}),
+        ("<!--->", "<!--->", {}),
+        ("<!--wip--->", "<!--wip--->", {}),
+        ("<!-- a -- b -->", "<!-- a -- b -->", {}),  # a body containing "--" is not a comment here (fail-closed)
+        ("<!DOCTYPE html> shipped", " shipped", {}),
+        ("<!bug> shipped", " shipped", {}),
         # entities show their character
         ("&amp; &copy; &#35; &#X22;", "& \u00a9 # \"", {}),
         ("&notanentity;", "&notanentity;", {}),
@@ -156,3 +162,70 @@ class ParserRobustness(unittest.TestCase):
     def test_a_long_label_is_not_link_syntax_but_its_words_show(self):
         label = "do not merge " * 200
         self.assertIn("do not merge", mg.rendered(f"[{label}](https://x.test)"))
+
+
+class ReviewedDefects(unittest.TestCase):
+    """Every case here is a defect an adversarial review of this parser found after it was written; the comment
+    records whether it was a regression introduced by the rewrite or inherited from the regex rounds."""
+
+    def test_a_space_before_the_parenthesis_is_not_a_link(self):
+        # regression: CommonMark needs "(" immediately after "]". Otherwise a visible "(wip)" disappeared.
+        self.assertEqual(md.render("[a] (wip)"), "[a] (wip)")
+        pr = _pr("Rollback [plan] (wip)")
+        self.assertEqual(mg.decide(pr, "", mg.Policy(frozenset()), T0).action, "REPORT")
+
+    def test_brackets_inside_a_code_span_are_not_delimiters(self):
+        # regression: the "]" inside backticks closed an outside "[", eating the visible "(wip)".
+        self.assertEqual(md.render("See [x`](wip)` for details"), "See [x](wip) for details")
+        pr = _pr("See [x`](wip)` for details")
+        self.assertEqual(mg.decide(pr, "", mg.Policy(frozenset()), T0).action, "REPORT")
+
+    def test_an_outer_bracket_around_a_link_is_literal(self):
+        # regression: links may not contain links, so the outer "[...](wip)" must stay visible.
+        self.assertEqual(md.render("[o [i](u)](wip)"), "[o i](wip)")
+        pr = _pr("[o [i](u)](wip)")
+        self.assertEqual(mg.decide(pr, "", mg.Policy(frozenset()), T0).action, "REPORT")
+
+    def test_ambiguous_comments_render_literally(self):
+        # inherited: cmark's grammar rejects a body ending in "-", and "<!-->" / "<!--->" are not comments here,
+        # so a hold written inside one stays visible instead of vanishing.
+        self.assertIn("do not merge", md.render("Rollback: <!-- do not merge --->").lower())
+        self.assertIn("do not merge", md.render("<!-->do not merge-->").lower())
+        self.assertIn("wip", md.render("<!--->WIP").lower())
+
+    def test_a_closing_tag_takes_no_attributes(self):
+        # inherited: cmark's closetag is "</" name space* ">" only, so "</b wip>" is literal text.
+        self.assertEqual(md.render("</b wip>"), "</b wip>")
+        pr = _pr("Backout </span wip> pending")
+        self.assertEqual(mg.decide(pr, "", mg.Policy(frozenset()), T0).action, "REPORT")
+
+    def test_a_bare_destination_may_contain_balanced_parens(self):
+        # inherited false REPORT: the destination was not recognised, so its invisible words counted as findings.
+        self.assertEqual(md.render("[see](u(a(bug)))"), "see")
+        self.assertEqual(md.render("[the run](https://ex.test/p3(x))"), "the run")
+
+    def test_a_declaration_needs_no_space_after_its_name(self):
+        # inherited false REPORT: "<!bug>" is a declaration (hidden), not visible words.
+        self.assertEqual(md.render("<!bug> shipped"), " shipped")
+
+
+class NotTheRegexesAgain(unittest.TestCase):
+    """The point of #36: the constructs that kept interacting, asserted together in one pass."""
+
+    def test_the_escaped_backtick_case_and_its_neighbours(self):
+        cases = {
+            r"\` `<WIP>`": "` <WIP>",          # the #36 hole: the code span must still open at the real backtick
+            "`<WIP>`": "<WIP>",                # a code span keeps its contents literal
+            r"\`WIP\`": "`WIP`",               # an escaped backtick is a literal backtick, and the word stays visible
+            "`` `<WIP>` ``": "`<WIP>`",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(md.render(text), expected)
+
+    def test_no_link_syntax_survives_as_a_bare_destination(self):
+        # every destination form hides its URL but keeps its label
+        for text, expected in [("[a](u)", "a"), ("[a](<u v>)", "a"), ('[a](u "t")', "a"),
+                               ("[a](u(a))", "a"), (r"[a](u\(a\))", "a"), ("[a][b]", "a")]:
+            with self.subTest(text=text):
+                self.assertEqual(md.render(text, frozenset({"b"})), expected)
