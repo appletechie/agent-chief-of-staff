@@ -33,7 +33,10 @@ MD_LINK = re.compile(r"!?\[([^\]]*)\]\(\s*(?:<[^<>\n]*>|[^\s()<>]*)(?:\s+(?:\"[^
 MD_REF_LINK = re.compile(r"!?\[([^\]]*)\]\[([^\]]*)\]")
 MD_REF_DEF = re.compile(r"^ {0,3}\[([^\]]+)\]:[ \t]*\S")
 MD_AUTOLINK = re.compile(r"<([a-z][a-z0-9+.-]*:[^<>\s]*)>", re.I)
-HTML_TAG = re.compile(r"<!--.*?-->|</?[a-z][a-z0-9-]*(?:\s[^<>]*)?/?>", re.I | re.S)
+HTML_TAG = re.compile(r"<!--.*?-->|</?([a-z][a-z0-9-]*)(?:\s[^<>]*)?/?>", re.I | re.S)
+# A block-level tag separates what it encloses (<p>WIP</p><p>Ready</p> shows two words), so it reads as a space; an
+# inline tag (<b>, <span>) does not split a word (Codex on #35).
+HTML_BLOCK = re.compile(r"(?:address|article|aside|blockquote|br|dd|details|dialog|div|dl|dt|fieldset|figcaption|figure|footer|form|h[1-6]|header|hr|li|main|nav|ol|p|pre|section|summary|table|tbody|td|tfoot|th|thead|tr|ul)", re.I)
 # A fence delimiter is indented at most 3 spaces (CommonMark): a "    ```" line inside a fence does not close it (#31).
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 # An inline code span renders its contents literally: `<WIP>` and `<!-- do not merge -->` are visible text (Codex on #35).
@@ -186,7 +189,8 @@ def _prose(text: str, defined: frozenset = frozenset()) -> str:
     text = MD_ESCAPE.sub(lambda m: chr(0xF0000 + ord(m.group(1))), text)
     text = MD_REF_LINK.sub(lambda m: m.group(1) if _ref_label(m.group(2) or m.group(1)) in defined else m.group(0),
                            MD_LINK.sub(r"\1", text))
-    text = HTML_TAG.sub("", MD_AUTOLINK.sub(r"\1", text))
+    text = HTML_TAG.sub(lambda m: " " if m.group(1) and HTML_BLOCK.fullmatch(m.group(1)) else "",
+                        MD_AUTOLINK.sub(r"\1", text))
     text = re.sub("[\U000F0000-\U000F007F]", lambda m: chr(ord(m.group(0)) - 0xF0000), text)
     return html.unescape(MD_MARKS.sub("", text))
 

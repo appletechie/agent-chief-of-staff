@@ -73,6 +73,13 @@ class RenderedText(unittest.TestCase):
         self.assertEqual(mg.rendered("[ready][WIP]\n\n[wip]: https://x.test").splitlines()[0], "ready")
         self.assertEqual(mg.rendered('[a](<x y> "t") [b][] [c](d)\n[B]: e'), "a b c\n[B]: e")
 
+    def test_block_tags_keep_words_apart(self):
+        # Codex on #35: adjacent block elements show separate words; inline tags still join.
+        self.assertEqual(mg.decide(pr("<p>WIP</p><p>Ready</p>"), "", mg.Policy(frozenset()), T0).action, "REPORT")
+        self.assertEqual(mg.review_verdict(pr(review="verdict: clean\n<p>See</p><p>P1</p>"), mg.Policy(frozenset())),
+                         "findings")
+        self.assertEqual(" ".join(mg.rendered("<td>a</td><td>b</td> do<b>n</b>'t").split()), "a b don't")
+
     def test_three_space_closer_still_closes(self):
         p = pr(review="Example:\n```text\nexample\n   ```\nverdict: clean")
         self.assertEqual(mg.decide(p, "", mg.Policy(frozenset()), T0).action, "MERGE")
