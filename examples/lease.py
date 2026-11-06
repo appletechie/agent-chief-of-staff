@@ -19,12 +19,19 @@ re-read the lease, see it is no longer primary, and act as a companion.
           write after it is refused. Writers do not block each other.
 
 A lease file that does not parse, or parses with a bad field (no primary, a renewed_at or since that is not an ISO
-8601 time with a time zone, a ttl_s or epoch that is not a positive whole number), raises LeaseError from every
-read: state, holder, epoch, fenced, renew and take. Nothing repairs it automatically. A scheduled job (the timer
+8601 time with a time zone, a ttl_s or epoch that is not a whole number in range: ttl_s 1..MAX_TTL_S, epoch
+1..MAX_EPOCH, #34), raises LeaseError from every read: state, holder, epoch, fenced, renew and take. Writers apply the
+same rules before they write (init, renew, take): a lease the next read would reject is never written, so a take with
+host=None or past the last epoch fails with LeaseError and leaves the file as it was (#34). Nothing repairs it automatically. A scheduled job (the timer
 tick, the merge gate, intake) calls primary_gate() first: a LeaseError there reads as "not primary here", one log
 line, and the job skips. No lease file is the same: nobody is primary until init(), primary_gate() skips and
 fenced() raises LeaseError, so nothing writes at "epoch 0" by accident (#25). A lease written before epochs existed
 (no epoch field) is still valid, epoch 0.
+
+Lock identity (#34): the lease lock is the file at lease.lock (its inode), as for every store lock. Never rename, delete
+or replace a lock file while anything may hold it. If one is replaced anyway, a taker that locked the old file drops
+it and locks the new one, and a holder whose file was replaced gets LeaseError before it writes, so two takes never
+both write (no two holders of epoch N+1).
 
 Lock order: the lease lock before a store lock. init, renew and take never take a store lock, so a writer that
 waits for the lease lock while holding its store lock (Timers.tick, after a send) cannot deadlock. Inside fenced(),
@@ -44,6 +51,10 @@ from pathlib import Path
 
 TTL = timedelta(hours=2)
 LOCK_TIMEOUT = 20.0
+# Past these, a field read from the file fails later arithmetic or serialization (timedelta overflow, the 4300-digit
+# int-to-str limit), so the read rejects it (#34).
+MAX_EPOCH = 2 ** 53 - 1  # the largest integer every JSON reader keeps exact
+MAX_TTL_S = 366 * 86400
 
 _local = threading.local()
 
@@ -72,8 +83,25 @@ def clock(now: datetime | None) -> datetime:
     return now
 
 
-def whole(value, minimum: int = 1) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+def whole(value, minimum: int = 1, maximum: int | None = None) -> bool:
+    return (isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+            and (maximum is None or value <= maximum))
+
+
+def shown(value, n: int = 40) -> str:
+    """A field for an error message: an int too long to print is described by its size (str() of it would raise)."""
+    if isinstance(value, int) and not isinstance(value, bool) and value.bit_length() > 128:
+        return f"<a {value.bit_length()}-bit number>"
+    return repr(str(value)[:n])
+
+
+def same_file(fd: int, path: Path) -> bool:
+    """Is the open file fd still the file at path? False once path was renamed, deleted or replaced."""
+    try:
+        mine, now = os.fstat(fd), os.stat(path)
+    except FileNotFoundError:
+        return False
+    return (mine.st_dev, mine.st_ino) == (now.st_dev, now.st_ino)
 
 
 def lease_problem(lease: dict) -> str | None:
@@ -82,13 +110,13 @@ def lease_problem(lease: dict) -> str | None:
         return "'primary' is missing or not a string"
     if "host" in lease and not isinstance(lease["host"], str):
         return f"'host' is {type(lease['host']).__name__}, not a string"
-    if not whole(lease.get("ttl_s")):
-        return f"'ttl_s' {str(lease.get('ttl_s'))[:40]!r} is not a whole number of seconds > 0"
-    if "epoch" in lease and not whole(lease["epoch"]):
-        return f"'epoch' {str(lease['epoch'])[:40]!r} is not a whole number >= 1"
+    if not whole(lease.get("ttl_s"), 1, MAX_TTL_S):
+        return f"'ttl_s' {shown(lease.get('ttl_s'))} is not a whole number of seconds from 1 to {MAX_TTL_S}"
+    if "epoch" in lease and not whole(lease["epoch"], 1, MAX_EPOCH):
+        return f"'epoch' {shown(lease['epoch'])} is not a whole number from 1 to {MAX_EPOCH}"
     for name in ("renewed_at", "since"):
         if (name == "renewed_at" or name in lease) and aware(lease.get(name)) is None:
-            return f"{name!r} {str(lease.get(name))[:40]!r} is not an ISO 8601 time with a time zone"
+            return f"{name!r} {shown(lease.get(name))} is not an ISO 8601 time with a time zone"
     return None
 
 
@@ -114,15 +142,19 @@ def file_lock(path: Path, timeout: float = LOCK_TIMEOUT, shared: bool = False):
         while True:
             try:
                 fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
-                break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"{path} held by {Path(path).read_text().strip() or 'unknown'}")
                 time.sleep(0.05)
+                continue
+            if same_file(fd, path):
+                break
+            os.close(fd)  # locked a file that is no longer at path: lock the one that is (#34)
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         if not shared:  # shared holders would overwrite each other's pid
             os.ftruncate(fd, 0)
             os.write(fd, f"pid={os.getpid()}".encode())
-        held[path] = [1, shared]
+        held[path] = [1, shared, fd]
         try:
             yield
         finally:
@@ -158,10 +190,20 @@ class Lease:
         return lease
 
     def _write(self, data: dict) -> dict:
+        """Write a lease the next read accepts, under a lock that is still the lock file; else LeaseError and the file
+        stays as it was (#34)."""
+        problem = lease_problem(data)
+        if problem:
+            raise LeaseError(f"refused to write {self.path}: {problem}; the lease on disk is unchanged")
+        text = json.dumps(data, indent=2)
+        held = _local.__dict__.setdefault("held", {}).get(self.lock.resolve())
+        if held is None or not same_file(held[2], self.lock):
+            raise LeaseError(f"lease lock {self.lock} is not held, or was renamed, deleted or replaced while held; "
+                             "nothing written: re-read the lease and retry")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=self.path.parent)
         with os.fdopen(fd, "w") as fh:
-            json.dump(data, fh, indent=2)
+            fh.write(text)
         os.replace(tmp, self.path)
         return data
 

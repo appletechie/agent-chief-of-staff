@@ -24,7 +24,7 @@ The ledger is the coordinator's memory. It is a plain Markdown table with one ro
 ### Size limits
 
 - Keep a row under about 500 characters, owner cell excluded. Treat it as a warning, not an error: a refused write in the middle of a close-out is worse than a long row.
-- The write function spills anything longer into `ledger/notes/<id>.md`, then cuts each over-long cell (next action first, then waits on) and leaves a pointer to the note in the cut cell. In `waits on` it never cuts a clause that starts with "then": it cuts the longest other clause from its end, so the queue and the later step (often the owner's) both still show.
+- The write function spills anything longer into `ledger/notes/<id>.md`, then cuts each over-long cell (next action first, then waits on) and leaves a pointer to the note in the cut cell. In `waits on` it cuts a clause that starts with "then" last: it cuts the longest other clause from its end first, so the queue and the later step (often the owner's) both still show, and cuts the "then" clause from its end only when nothing else brings the row under budget. Spilled text always leaves the pointer in the row (after karutoil's [#33](https://github.com/appletechie/agent-chief-of-staff/issues/33)).
 - History, caveats, side findings and proofs go in notes or as tracker comments, never as new rows.
 
 ### When to open a row
@@ -57,6 +57,8 @@ check()                         # structural checker, exit non-zero on error
 - Take an exclusive advisory lock (`flock`/`fcntl` on POSIX, a lock file with O_EXCL elsewhere, or a database row lock) for every write, including dashboard regeneration that reads the ledger.
 - Write to a temp file in the same directory and rename over the original. Never leave a half-written ledger.
 - Make the lock re-entrant within a process and record the holder's pid and script name in the lock file, so a timeout can say who is holding it.
+- The lock is the file at the lock path (its inode), not the name. Never rename, delete or replace a lock file while anything may hold it. If it happens anyway: a taker that locked a file no longer at the path drops it and locks the path's file, and a holder re-checks that its file is still at the path right before each replace and writes nothing when it is not. Otherwise two processes hold "the" lock at once (after karutoil's [#34](https://github.com/appletechie/agent-chief-of-staff/issues/34)).
+- A cell value never carries a line break: every boundary `splitlines()` breaks on (CR, NEL, U+2028, U+2029, not only LF) becomes a space, so one write is one row. A row that names several PRs closes as `merged` only when every one of them is merged (#33).
 - After every write, run the checker and regenerate the dashboard. If the checker fails, fix the row before doing anything else in the same turn (no sends, no archives, no closes).
 - Never hand-edit a row while another session is live.
 - With a lease, every write carries the writer's lease epoch and is refused when the lease has moved on. The check and the write share one fence (the lease lock, held shared, taken before the ledger lock), so a takeover can't land between them (see [sessions-and-recovery.md](sessions-and-recovery.md#fencing)).

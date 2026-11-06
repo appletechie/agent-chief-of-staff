@@ -52,6 +52,8 @@ LOCK_TIMEOUT = 20.0
 DEFAULT_DELAY = timedelta(minutes=60)
 WAIT_LINE = re.compile(r"^\s*WAIT\b\s*(?P<kind>\S+)?\s*(?P<ref>\S+)?\s*(?P<check_by>.+)?$")
 KINDS = {"ci", "review", "deploy", "render", "date", "person", "other"}
+# attempts is bounded: a huge count fails the save after a send (the int-to-str digit limit) and stops every timer (#34)
+MAX_ATTEMPTS = 10 ** 9
 
 _local = threading.local()
 
@@ -64,17 +66,31 @@ class StaleEpoch(RuntimeError):
     """The lease was taken after the caller read its epoch: this session is no longer the one it thinks it is."""
 
 
+class LockLost(RuntimeError):
+    """The timer lock file was renamed, deleted or replaced while held: another tick can hold it now (#34)."""
+
+
+def same_file(fd: int, path: Path) -> bool:
+    """Is the open file fd still the file at path? False once path was renamed, deleted or replaced."""
+    try:
+        mine, now = os.fstat(fd), os.stat(path)
+    except FileNotFoundError:
+        return False
+    return (mine.st_dev, mine.st_ino) == (now.st_dev, now.st_ino)
+
+
 @contextmanager
 def file_lock(path: Path, timeout: float = LOCK_TIMEOUT):
-    """Exclusive advisory lock, re-entrant per thread. Copied from ledger_store.file_lock to keep this file standalone."""
+    """Exclusive advisory lock, re-entrant per thread. Copied from ledger_store.file_lock to keep this file standalone:
+    the lock is the file at path, so a taker that locked a file no longer there locks the path's file instead (#34)."""
     path = Path(path).resolve()
     held = _local.__dict__.setdefault("held", {})
     if path in held:
-        held[path] += 1
+        held[path][0] += 1
         try:
             yield
         finally:
-            held[path] -= 1
+            held[path][0] -= 1
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -83,14 +99,18 @@ def file_lock(path: Path, timeout: float = LOCK_TIMEOUT):
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     raise LockTimeout(f"{path} held by {Path(path).read_text().strip() or 'unknown'}")
                 time.sleep(0.05)
+                continue
+            if same_file(fd, path):
+                break
+            os.close(fd)
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         os.ftruncate(fd, 0)
         os.write(fd, f"pid={os.getpid()}".encode())
-        held[path] = 1
+        held[path] = [1, fd]
         try:
             yield
         finally:
@@ -131,18 +151,19 @@ def parse_due(text: str | None, now: datetime) -> tuple[datetime, str | None]:
 
 
 def parse_wait(line: str, now: datetime) -> dict | None:
-    """Parse `WAIT <kind> <ref> <check-by>` leniently. Only WAIT is required."""
+    """Parse `WAIT <kind> <ref> <check-by>` leniently. Only WAIT is required. A first word that is not a known kind
+    is not consumed as one: the kind is `other` and that word is the ref, or the check-by (#33)."""
     now = clock(now)
     m = WAIT_LINE.match(line or "")
     if not m:
         return None
-    kind = (m.group("kind") or "other").lower()
-    if kind not in KINDS:
-        kind = "other"
-    ref, when = m.group("ref") or "", m.group("check_by")
-    # "WAIT ci +45m": with the ref omitted, the time lands in the ref slot. If it parses as a time, it is one.
-    if when is None and ref and parse_due(ref, now)[1] is None:
-        ref, when = "", ref
+    words = " ".join(w for w in (m.group("kind"), m.group("ref"), m.group("check_by")) if w).split()
+    kind = words.pop(0).lower() if words and words[0].lower() in KINDS else "other"
+    # "WAIT ci +45m" or "WAIT +45m": with the ref omitted, what is left is the time if it parses as one.
+    if words and parse_due(" ".join(words), now)[1] is None:
+        ref, when = "", " ".join(words)
+    else:
+        ref, when = (words[0] if words else ""), (" ".join(words[1:]) or None)
     due, note = parse_due(when, now)
     return {"kind": kind, "ref": ref, "due": due, "note": note}
 
@@ -181,8 +202,10 @@ def timer_problem(t) -> str | None:
         if not isinstance(t.get(name), str):
             return f"{name!r} is missing or not a string"
     attempts = t.get("attempts", 0)
-    if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0:
-        return f"'attempts' {str(attempts)[:20]!r} is not a whole number"
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or not 0 <= attempts <= MAX_ATTEMPTS:
+        shown = f"<a {attempts.bit_length()}-bit number>" if isinstance(attempts, int) and attempts.bit_length() > 128 \
+            else repr(str(attempts)[:20])
+        return f"'attempts' {shown} is not a whole number from 0 to {MAX_ATTEMPTS}"
     for name in ("due", "first_attempt_at"):
         if (name == "due" or name in t) and aware(t.get(name)) is None:
             return f"{name!r} {str(t.get(name))[:40]!r} is not an ISO 8601 time with a time zone"
@@ -220,10 +243,14 @@ class Timers:
         return timers  # each record is checked by timer_problem() where it is used
 
     def save(self, timers: list[dict]) -> None:
+        text = json.dumps(timers, indent=2)  # serialize first: a value that can't be written leaves no temp file
+        held = _local.__dict__.setdefault("held", {}).get(self.lock.resolve())
+        if held is not None and not same_file(held[1], self.lock):
+            raise LockLost(f"{self.lock} was renamed, deleted or replaced while held; {self.path.name} not written")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=self.path.parent)
         with os.fdopen(fd, "w") as fh:
-            json.dump(timers, fh, indent=2)
+            fh.write(text)
         os.replace(tmp, self.path)
 
     def add(self, row: str, due: str, name: str, prompt: str, target: str = "coordinator",
@@ -271,7 +298,7 @@ class Timers:
                 return self._tick(send, open_rows, now, expect_epoch)
         except LockTimeout:
             return ["another tick is running; delivered nothing"]
-        except TimersCorrupt as error:
+        except (TimersCorrupt, LockLost) as error:
             return [str(error)]
 
     def _tick(self, send, open_rows: set[str], now: datetime, expect_epoch: int | None) -> list[str]:
