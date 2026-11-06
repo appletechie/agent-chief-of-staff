@@ -66,6 +66,13 @@ class RenderedText(unittest.TestCase):
             self.assertEqual(mg.decide(pr(body), "", mg.Policy(frozenset()), T0).action, "REPORT", body)
         self.assertEqual(mg.rendered("\\<b>x\\</b> \\*y\\* <i>z</i>"), "<b>x</b> y z")
 
+    def test_undefined_references_and_non_links_show_as_written(self):
+        # Codex on #35: "[ready][WIP]" with no definition, and "[x](WIP status)" (not a destination), are literal text.
+        for body in ["Status: [ready][WIP]", "Status: [ready](WIP status)", "[ready][wip]\n\n```\n[wip]: x\n```"]:
+            self.assertEqual(mg.decide(pr(body), "", mg.Policy(frozenset()), T0).action, "REPORT", body)
+        self.assertEqual(mg.rendered("[ready][WIP]\n\n[wip]: https://x.test").splitlines()[0], "ready")
+        self.assertEqual(mg.rendered('[a](<x y> "t") [b][] [c](d)\n[B]: e'), "a b c\n[B]: e")
+
     def test_three_space_closer_still_closes(self):
         p = pr(review="Example:\n```text\nexample\n   ```\nverdict: clean")
         self.assertEqual(mg.decide(p, "", mg.Policy(frozenset()), T0).action, "MERGE")
