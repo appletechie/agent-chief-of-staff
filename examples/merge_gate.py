@@ -7,6 +7,7 @@ The caller merges only on MERGE, and passes pr.head_sha as the expected head so 
 """
 from __future__ import annotations
 
+import html
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -171,10 +172,12 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
 def _prose(text: str) -> str:
     """Rendered prose: an escaped character shows as itself (`\\<WIP>` displays `<WIP>`, Codex on #35), so escapes
     are set aside while link labels lose their destinations and HTML tags and comments go; then emphasis marks go,
-    escaped ones too (`do \\*not\\* merge` still reads as a hold)."""
+    escaped ones too (`do \\*not\\* merge` still reads as a hold), and HTML entities read as their characters
+    (`do&nbsp;not merge`)."""
     text = MD_ESCAPE.sub(lambda m: chr(0xF0000 + ord(m.group(1))), text)
     text = HTML_TAG.sub("", MD_AUTOLINK.sub(r"\1", MD_LINK.sub(r"\1", text)))
-    return MD_MARKS.sub("", re.sub("[\U000F0000-\U000F007F]", lambda m: chr(ord(m.group(0)) - 0xF0000), text))
+    text = re.sub("[\U000F0000-\U000F007F]", lambda m: chr(ord(m.group(0)) - 0xF0000), text)
+    return html.unescape(MD_MARKS.sub("", text))
 
 
 def _rendered_prose(text: str) -> str:
@@ -191,7 +194,8 @@ def rendered(text: str) -> str:
     comments dropped, escapes undone, emphasis and code marks dropped, runs of spaces read as one. `Draft\\:` reads
     `Draft:`, and `do **not** merge`, `do [not](url) merge` and `do <span>not</span> merge` read `do not merge`, so
     formatting never hides a hold marker (#28, #31) or a finding. Code is shown literally, so its contents are kept
-    as they are: a fenced block's lines, and an inline code span such as `<WIP>` (Codex on #35)."""
+    as they are: a fenced block's lines, an indented code line (4 spaces or a tab) and an inline code span such as
+    `<WIP>` (Codex on #35)."""
     parts, prose, fence, size = [], [], None, 0
     for line in (text or "").splitlines():
         opener = FENCE.match(line)
@@ -203,6 +207,10 @@ def rendered(text: str) -> str:
                 fence = None
             else:
                 parts.append(line)
+        elif INDENTED.match(line):
+            parts.append(_rendered_prose("\n".join(prose)))
+            prose = []
+            parts.append(line)
         else:
             prose.append(line)
     parts.append(_rendered_prose("\n".join(prose)))

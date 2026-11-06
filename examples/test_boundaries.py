@@ -53,7 +53,7 @@ class RenderedText(unittest.TestCase):
     def test_holds_inside_code_are_shown_literally_and_still_hold(self):
         # Codex on #35: a code span or a fenced block renders its contents as text, tags and comments included.
         for body in ["`<!-- do not merge -->`", "`<WIP>`", "``do not merge``", "```\n<!-- on hold -->\n```",
-                     "status: `[do not merge](x)`"]:
+                     "status: `[do not merge](x)`", "Notes:\n\n    <WIP>", "Notes:\n\n\t<!-- do not merge -->"]:
             self.assertEqual(mg.decide(pr(body), "", mg.Policy(frozenset()), T0).action, "REPORT", body)
         self.assertEqual(mg.rendered("a `<b>x</b>` [y](z) <i>w</i>"), "a <b>x</b> y w")
 
@@ -61,7 +61,8 @@ class RenderedText(unittest.TestCase):
         # Codex on #35: a title is plain text, and an escaped tag or comment displays literally.
         held = mg.PR("org/app", 1, "<WIP> Parser", "", SHA, False, True, {"ci": "success"}, [mg.Review(SHA, "verdict: clean")], 0, T0)
         self.assertEqual(mg.decide(held, "", mg.Policy(frozenset()), T0).action, "REPORT")
-        for body in ["\\<WIP> parser", "\\<!-- do not merge -->", "do \\*not\\* merge", "\\[on hold\\](x)"]:
+        for body in ["\\<WIP> parser", "\\<!-- do not merge -->", "do \\*not\\* merge", "\\[on hold\\](x)",
+                     "do&nbsp;not merge", "&#87;IP parser", "&lt;WIP&gt;"]:
             self.assertEqual(mg.decide(pr(body), "", mg.Policy(frozenset()), T0).action, "REPORT", body)
         self.assertEqual(mg.rendered("\\<b>x\\</b> \\*y\\* <i>z</i>"), "<b>x</b> y z")
 
