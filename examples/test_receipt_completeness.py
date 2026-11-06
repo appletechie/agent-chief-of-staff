@@ -42,7 +42,8 @@ class RenderedReceiptTests(unittest.TestCase):
 
 class ArchiveCompletenessTests(unittest.TestCase):
     def test_a_row_lost_its_last_cell_is_not_a_whole_archive_record(self):
-        root=pathlib.Path(tempfile.mkdtemp()); path=root/"ledger"/"closed-2026-01.md";path.parent.mkdir()
+        tmp=tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        root=pathlib.Path(tmp.name); path=root/"ledger"/"closed-2026-01.md";path.parent.mkdir()
         path.write_text('| R-001 | ISSUE-1 | 2026-01-16 14:00Z | merged: abcdef1 - merged once |\n')
         ledger=ls.Ledger(root)
         self.assertTrue(ledger.archive_problems())

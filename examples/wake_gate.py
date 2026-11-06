@@ -14,8 +14,8 @@ Rules this sketch implements:
     error: the caller believes the save is fenced and it is not;
   - parts listed in `new_only` (e.g. health findings) change only when a new item appears;
   - a snapshot that parses but has a bad field (not an object, parts that are not objects, a last_changed_at that
-    is not an ISO 8601 time with a time zone) counts as CHANGED, never as quiet; the bad field is dropped, so this
-    pass saves a clean snapshot.
+    is not an ISO 8601 time with a time zone, or none at all: null or missing, so max_quiet could never fire, #34)
+    counts as CHANGED, never as quiet; the bad field is dropped, so this pass saves a clean snapshot.
 """
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ def clock(now: datetime | None) -> datetime:
 
 def check_snapshot(previous) -> tuple[dict, list[str]]:
     """(snapshot, problems): drop each field evaluate() can't trust and say why. Any problem means CHANGED."""
-    if previous is None:
+    if previous is None or previous == {}:  # no snapshot yet: evaluate() says "no previous snapshot"
         return {"parts": {}}, []
     if not isinstance(previous, dict):
         return {"parts": {}}, [f"previous snapshot is {type(previous).__name__}, not an object; forcing a pass"]
@@ -77,7 +77,10 @@ def check_snapshot(previous) -> tuple[dict, list[str]]:
         parts = {name: items for name, items in parts.items() if isinstance(items, dict)}
     previous["parts"] = parts
     stamp = previous.get("last_changed_at")
-    if stamp is not None and aware(stamp) is None:
+    if stamp is None and "__unreadable__" not in previous:
+        problems.append("previous snapshot has no last_changed_at (null or missing); forcing a pass")
+        previous.pop("last_changed_at", None)
+    elif stamp is not None and aware(stamp) is None:
         problems.append(f"previous snapshot last_changed_at {str(stamp)[:40]!r} is not an ISO 8601 time with a time zone; "
                         "forcing a pass")
         del previous["last_changed_at"]

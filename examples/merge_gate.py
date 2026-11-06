@@ -20,9 +20,16 @@ PENDING = {"queued", "in_progress", "pending", "waiting", "requested"}
 # Row holds are the owner's words: an uppercase token or a fixed phrase, not any prose containing "held".
 ROW_HOLD = re.compile(r"\bHOLD\b|\bHELD\b|(?i:\bon hold\b|\bdo not merge\b|\bdon'?t merge\b)")
 PR_HOLD = re.compile(r"(?i)\bdraft:|\bdraft until\b|\bmerge only after\b|\bdo not merge\b|\bdon'?t merge\b|\bon hold\b|\bwip\b")
-# Markdown that renders a hold marker: backslash escapes (Draft\:) and emphasis or code (do **not** merge) (#28).
+# Markdown that renders a hold marker: backslash escapes (Draft\:) and emphasis or code (do **not** merge) (#28), a
+# link or image whose label carries the words (do [not](url) merge) and inline HTML (do <span>not</span> merge) (#31).
+# The label stays and the destination goes; an autolink <https://...> renders as its address.
 MD_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
 MD_MARKS = re.compile(r"[*_`~]+")
+MD_LINK = re.compile(r"!?\[([^\]]*)\](?:\([^)]*\)|\[[^\]]*\])")
+MD_AUTOLINK = re.compile(r"<([a-z][a-z0-9+.-]*:[^<>\s]*)>", re.I)
+HTML_TAG = re.compile(r"<!--.*?-->|</?[a-z][a-z0-9-]*(?:\s[^<>]*)?/?>", re.I | re.S)
+# A fence delimiter is indented at most 3 spaces (CommonMark): a "    ```" line inside a fence does not close it (#31).
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 # An indented code line (4 spaces or a tab) is an example, like a fenced block (#28).
 INDENTED = re.compile(r"^(?: {4,}|\t)")
 # "Findings: None" (or a Findings heading over "None") says the list is empty (#28).
@@ -85,7 +92,7 @@ def _outside_fences(body: str) -> list[str]:
     example (#22) or a ```not-a-close line (#28) does not end it; an unclosed fence runs to the end."""
     out, fence, fence_size = [], None, 0
     for line in body.splitlines():
-        if opener := re.match(r"^[ ]{0,3}(`{3,}|~{3,})", line):
+        if opener := FENCE.match(line):
             here = opener.group(1)
             if fence is None:
                 fence, fence_size = here[0], len(here)
@@ -135,8 +142,7 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
     receipts = _receipts(pr)
     if not receipts:
         return None
-    # Preserve structural delimiters until _outside_fences() runs. `rendered()` is the text-normalization of a
-    # hold or finding; its fences must still exist here.
+    # Fences and verdict lines are read in the source (rendering drops the backticks); findings in the rendered words.
     body = receipts[-1].body.lower()
     # Explicit verdict wins over phrases, but the last one rather than the first: a receipt that repeats its
     # convention before the actual decision should not be judged by the example.
@@ -145,14 +151,15 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
     # count anywhere.
     outside = "\n".join(line for line in _outside_fences(body) if not INDENTED.match(line))
     clean = any(p in outside for p in policy.clean_phrases)
-    # "no issues", "no major findings" say there is nothing; they are not finding words themselves.
-    residue = re.sub(r"\bno\s+(?:major\s+)?(?:issues?|findings?|bugs?)\b", " ", body)
+    # "no issues", "no major findings" say there is nothing; they are not finding words themselves. Read in the
+    # rendered words, so "P**3**" is a P3 and "no **major** issues" is still nothing (#31).
+    residue = re.sub(r"\bno\s+(?:major\s+)?(?:issues?|findings?|bugs?)\b", " ", rendered(body))
     residue = CONDITIONAL.sub(" ", EMPTY_FINDINGS.sub(" ", residue))
     for phrase in policy.clean_phrases:
         residue = residue.replace(phrase, " ")
     # Findings anywhere in the receipt beat a clean verdict token: the token is a summary, the list is the
     # evidence that something is left.
-    if _has_finding(rendered(residue), policy.finding_phrases):
+    if _has_finding(residue, policy.finding_phrases):
         return "findings"
     if tokens:
         return tokens[-1]
@@ -160,14 +167,12 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
 
 
 def rendered(text: str) -> str:
-    """The words Markdown renders: escapes undone, emphasis and code marks dropped (`Draft\\:` reads `Draft:`, and
-    `do **not** merge` reads `do not merge`), so formatting never hides a hold marker (#28)."""
-    text = MD_MARKS.sub("", MD_ESCAPE.sub(r"\1", text or ""))
-    # Raw link destinations and HTML syntax are not the words an owner marked on a rendered page. Keep the label
-    # and tag content; discard only the machine-form wrapper, so both an inline-shortpath and inlined hold match.
-    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)
-    text = re.sub(r"(?i)</?[a-z][^>]*>", "", text)
-    return text
+    """The words Markdown renders, line by line: link and image labels without their destinations, HTML tags and
+    comments dropped, escapes undone, emphasis and code marks dropped, runs of spaces read as one. `Draft\\:` reads
+    `Draft:`, and `do **not** merge`, `do [not](url) merge` and `do <span>not</span> merge` read `do not merge`, so
+    formatting never hides a hold marker (#28, #31) or a finding."""
+    text = HTML_TAG.sub("", MD_AUTOLINK.sub(r"\1", MD_LINK.sub(r"\1", text or "")))
+    return re.sub(r"[ \t]+", " ", MD_MARKS.sub("", MD_ESCAPE.sub(r"\1", text)))
 
 
 def _has_finding(text: str, phrases) -> bool:
@@ -200,7 +205,8 @@ def decide(pr: PR, row_text: str, policy: Policy, now: datetime | None = None) -
     now = now or datetime.now(timezone.utc)
     if ROW_HOLD.search(row_text or ""):
         return Decision("REPORT", "row is on hold")
-    if PR_HOLD.search(rendered(f"{pr.title}\n{pr.body}")):
+    # a paragraph's line break renders as a space: "do not\nmerge" is a hold
+    if PR_HOLD.search(" ".join(rendered(f"{pr.title}\n{pr.body}").split())):
         return Decision("REPORT", "PR title or body carries a hold marker")
     if pr.is_draft and not policy.merge_drafts:
         return Decision("REPORT", "PR is a draft")
@@ -208,6 +214,7 @@ def decide(pr: PR, row_text: str, policy: Policy, now: datetime | None = None) -
         return Decision("WAIT", "mergeability not computed yet")
     if not pr.mergeable:
         return Decision("REPORT", "not mergeable")
+    # A required check that never ran is reported even when nothing ran at all (#31): before the no-checks WAIT.
     required = policy.required_checks.get(pr.repo, frozenset())
     missing = sorted(required - set(pr.checks))
     if missing:
@@ -217,10 +224,6 @@ def decide(pr: PR, row_text: str, policy: Policy, now: datetime | None = None) -
     if not pr.checks:
         return Decision("WAIT", f"no checks reported on {pr.head_sha[:7]} yet")
     states = {name: s.lower() for name, s in pr.checks.items()}
-    if missing:
-        if now - pr.last_push_at >= policy.check_wait:
-            return Decision("REPORT", "required checks never reported: " + ", ".join(missing))
-        return Decision("WAIT", "required checks not yet reported: " + ", ".join(missing))
     if any(s in PENDING for s in states.values()):
         return Decision("WAIT", "checks pending on head")
     red = sorted(n for n, s in states.items()

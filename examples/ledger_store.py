@@ -106,6 +106,11 @@ class LockTimeout(RuntimeError):
     pass
 
 
+class LockLost(RuntimeError):
+    """The lock file this thread holds is no longer the file at its path (renamed, deleted or replaced), so another
+    process can lock the path's new file: nothing may be written under it (#34)."""
+
+
 class ProofRefused(ValueError):
     """The proof is not evidence: unknown kind, empty or prose-only ref, or a claim such as "verified" alone."""
 
@@ -133,17 +138,43 @@ class StaleEpoch(RuntimeError):
     """The lease was taken after the caller read its epoch: re-read the lease before writing again."""
 
 
+def same_file(fd: int, path: Path) -> bool:
+    """Is the open file fd still the file at path? False once path was renamed, deleted or replaced."""
+    try:
+        mine, now = os.fstat(fd), os.stat(path)
+    except FileNotFoundError:
+        return False
+    return (mine.st_dev, mine.st_ino) == (now.st_dev, now.st_ino)
+
+
+def lock_intact(path: Path) -> None:
+    """Raise LockLost unless this thread holds path's lock and it is still the file at path. Writers call it right
+    before they replace the file the lock protects (#34)."""
+    path = Path(path).resolve()
+    held = _local.__dict__.setdefault("held", {}).get(path)
+    if held is None:
+        raise LockLost(f"{path} is not held by this thread; nothing written")
+    if not same_file(held[1], path):
+        raise LockLost(f"lock {path} was renamed, deleted or replaced while held; another process may hold it now. "
+                       "Nothing written: re-read and retry")
+
+
 @contextmanager
 def file_lock(path: Path, timeout: float = LOCK_TIMEOUT):
-    """Exclusive advisory lock, re-entrant within this process. Records the holder for error messages."""
+    """Exclusive advisory lock, re-entrant within this process. Records the holder for error messages.
+
+    The lock is the file at path (its inode), not the name: a lock file must never be renamed, deleted or replaced
+    while anything may hold it (#34). If it is, a taker that locked the old file finds it is no longer at path, drops
+    it and locks the path's file instead; a holder whose file was replaced gets LockLost from lock_intact() before
+    its next write, so two holders never both write."""
     path = Path(path).resolve()
     _held = _local.__dict__.setdefault("held", {})
     if path in _held:
-        _held[path] += 1
+        _held[path][0] += 1
         try:
             yield
         finally:
-            _held[path] -= 1
+            _held[path][0] -= 1
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -152,15 +183,19 @@ def file_lock(path: Path, timeout: float = LOCK_TIMEOUT):
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
             except BlockingIOError:
                 if time.monotonic() > deadline:
                     holder = Path(path).read_text().strip() or "unknown"
                     raise LockTimeout(f"{path} held by {holder}")
                 time.sleep(0.05)
+                continue
+            if same_file(fd, path):
+                break
+            os.close(fd)  # locked a file that is no longer at path: lock the one that is
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         os.ftruncate(fd, 0)
         os.write(fd, f"pid={os.getpid()}".encode())
-        _held[path] = 1
+        _held[path] = [1, fd]
         try:
             yield
         finally:
@@ -287,6 +322,7 @@ class Ledger:
                 lines[rows[row_id]["_line"] - 1] = new_line
             else:
                 lines.append(new_line)
+            lock_intact(self.lock)
             atomic_write(self.path, "\n".join(lines) + "\n")
             return current
 
@@ -340,6 +376,7 @@ class Ledger:
             # the note keeps the caller's ref and text verbatim (whitespace and line breaks included)
             note_path, entry = self.notes / f"{row_id}.md", f"## proof\nkind: {kind}\nref: {ref}\n{text}\n"
             prior = note_path.read_text() if note_path.exists() else ""
+            lock_intact(self.lock)
             if entry not in prior:
                 atomic_write(note_path, prior + "\n" + entry)
             if same is not None:
@@ -351,6 +388,7 @@ class Ledger:
                 atomic_write(archive, old + ("" if old.endswith("\n") else "\n")
                              + table_line([row_id, row["key"], f"{now:%Y-%m-%d %H:%MZ}", clean(str(proof)), row["next"]]) + "\n")
             del lines[row["_line"] - 1]
+            lock_intact(self.lock)
             atomic_write(self.path, "\n".join(lines) + "\n")
             return str(archive)
 
@@ -369,8 +407,10 @@ class Ledger:
     def _spill(self, row: dict) -> dict:
         """Over budget: save the full text to the row's note, then cut next action, then waits on, until it fits.
 
-        In waits on, a clause that starts with "then" (a later step, often the owner's) is never cut: the longest
-        other clause is cut from its end, so the first clause still sets the queue and the later step still shows."""
+        In waits on, a clause that starts with "then" (a later step, often the owner's) is cut last: the longest
+        other clause is cut from its end first, so the first clause still sets the queue and the later step still
+        shows; a "then" clause is cut only when nothing else brings the row under budget (#33). Spilled text always
+        leaves the note pointer in the row."""
         if row_chars(row) <= ROW_BUDGET:
             return row
         self.notes.mkdir(parents=True, exist_ok=True)
@@ -385,6 +425,8 @@ class Ledger:
             if over <= 0:
                 break
             row[k] = cut_waits(row[k], over, pointer) if k == "waits" else cut(row[k], over, pointer)
+        if not any(pointer in row[c] for c in SPILL_ORDER):  # nothing could be cut: the note still has to be findable
+            row["waits"] = (row["waits"] if row["waits"] not in NONE else "") + pointer
         return row
 
     # ---------- checking ----------
@@ -612,7 +654,8 @@ def compose_close_policies(*policies: Callable[[dict, Proof], str | None] | None
 
 
 def pr_merge_policy(lookup: Callable[[str, int], str | None]) -> Callable[[dict, Proof], str | None]:
-    """A can_close policy: a row whose cells name a PR closes as `merged` only with that PR's merge SHA.
+    """A can_close policy: a row whose cells name PRs closes as `merged` only when the ref is one of those PRs' merge
+    SHA and every PR the row names is merged: a row about two PRs is not done when one of them is (#33).
 
     lookup(repo, number) returns the merge commit SHA, or None when the PR is not merged; inject your VCS client
     (for GitHub: `gh pr view N -R repo --json state,mergeCommit`). A lookup error refuses the close."""
@@ -620,16 +663,22 @@ def pr_merge_policy(lookup: Callable[[str, int], str | None]) -> Callable[[dict,
         prs = pr_refs(" ".join(str(row.get(k, "")) for k in FIELDS))
         if proof.kind != "merged" or not prs:
             return None
-        seen = []
+        seen, unmerged, matched = [], [], False
         for repo, number in prs:
             try:
                 sha = lookup(repo, number)
             except Exception as error:  # a broken lookup must not read as "allowed"
                 return f"cannot read {repo}#{number} ({error})"
-            if sha and sha.lower().startswith(proof.ref.lower()):
-                return None
+            matched = matched or bool(sha and sha.lower().startswith(proof.ref.lower()))
+            if not sha:
+                unmerged.append(f"{repo}#{number}")
             seen.append(f"{repo}#{number} " + (f"merged {sha[:7]}" if sha else "not merged"))
-        return f"{proof.ref} is not the merge SHA of the row's PR ({'; '.join(seen)})"
+        if not matched:
+            return f"{proof.ref} is not the merge SHA of the row's PR ({'; '.join(seen)})"
+        if unmerged:
+            return (f"the row also names {', '.join(unmerged)}, not merged ({'; '.join(seen)}); close it when every PR "
+                    "it names is merged, or move the others to their own row")
+        return None
     return can_close
 
 
@@ -664,7 +713,9 @@ def table_line(cells) -> str:
 
 
 def clean(value) -> str:
-    return str(value).replace("|", "/").replace("\n", " ").strip()
+    """One table cell: a "|" becomes "/", and every line boundary splitlines() breaks on (CR, NEL, U+2028, U+2029
+    and the rest, not only LF) becomes a space, so one write is always one row (#33)."""
+    return " ".join(str(value).replace("|", "/").splitlines()).strip()
 
 
 def row_chars(row: dict) -> int:
@@ -677,12 +728,18 @@ def cut(text: str, over: int, pointer: str) -> str:
 
 
 def cut_waits(text: str, over: int, pointer: str) -> str:
+    """Cut clauses, longest first, until over is used up: clauses that don't start with "then" before those that do.
+    The pointer goes on the first clause cut; a clause shorter than cut()'s floor is left whole."""
     clauses = text.split(";")
-    cuttable = [i for i, c in enumerate(clauses) if not c.strip().lower().startswith("then")]
-    if not cuttable:
-        return text
-    i = max(cuttable, key=lambda j: len(clauses[j]))
-    clauses[i] = cut(clauses[i], over, pointer)
+    order = sorted(range(len(clauses)), key=lambda j: (clauses[j].strip().lower().startswith("then"), -len(clauses[j])))
+    for i in order:
+        if over <= 0:
+            break
+        before = clauses[i]
+        clauses[i] = cut(before, over, pointer)
+        if clauses[i] != before:
+            over -= len(before) - len(clauses[i])
+            pointer = ""
     return ";".join(clauses)
 
 
