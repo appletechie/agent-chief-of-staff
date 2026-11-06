@@ -50,6 +50,13 @@ class RenderedText(unittest.TestCase):
         self.assertEqual(mg.review_verdict(pr(review="verdict: clean\n![P1 Badge](https://img.test/x) leak"),
                                            mg.Policy(frozenset())), "findings")
 
+    def test_holds_inside_code_are_shown_literally_and_still_hold(self):
+        # Codex on #35: a code span or a fenced block renders its contents as text, tags and comments included.
+        for body in ["`<!-- do not merge -->`", "`<WIP>`", "``do not merge``", "```\n<!-- on hold -->\n```",
+                     "status: `[do not merge](x)`"]:
+            self.assertEqual(mg.decide(pr(body), "", mg.Policy(frozenset()), T0).action, "REPORT", body)
+        self.assertEqual(mg.rendered("a `<b>x</b>` [y](z) <i>w</i>"), "a <b>x</b> y w")
+
     def test_three_space_closer_still_closes(self):
         p = pr(review="Example:\n```text\nexample\n   ```\nverdict: clean")
         self.assertEqual(mg.decide(p, "", mg.Policy(frozenset()), T0).action, "MERGE")

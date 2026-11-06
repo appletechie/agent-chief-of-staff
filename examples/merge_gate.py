@@ -30,6 +30,8 @@ MD_AUTOLINK = re.compile(r"<([a-z][a-z0-9+.-]*:[^<>\s]*)>", re.I)
 HTML_TAG = re.compile(r"<!--.*?-->|</?[a-z][a-z0-9-]*(?:\s[^<>]*)?/?>", re.I | re.S)
 # A fence delimiter is indented at most 3 spaces (CommonMark): a "    ```" line inside a fence does not close it (#31).
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+# An inline code span renders its contents literally: `<WIP>` and `<!-- do not merge -->` are visible text (Codex on #35).
+CODE_SPAN = re.compile(r"(`+)(.+?)(?<!`)\1(?!`)", re.S)
 # An indented code line (4 spaces or a tab) is an example, like a fenced block (#28).
 INDENTED = re.compile(r"^(?: {4,}|\t)")
 # "Findings: None" (or a Findings heading over "None") says the list is empty (#28).
@@ -166,13 +168,39 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
     return "clean" if clean else "unparsed"
 
 
+def _rendered_prose(text: str) -> str:
+    """Prose outside code: link labels without destinations, HTML tags and comments dropped, escapes undone, emphasis
+    marks dropped. Inline code spans keep their contents as they are and lose only the backticks."""
+    out, at = [], 0
+    for span in CODE_SPAN.finditer(text):
+        prose = HTML_TAG.sub("", MD_AUTOLINK.sub(r"\1", MD_LINK.sub(r"\1", text[at:span.start()])))
+        out += [MD_MARKS.sub("", MD_ESCAPE.sub(r"\1", prose)), span.group(2)]
+        at = span.end()
+    prose = HTML_TAG.sub("", MD_AUTOLINK.sub(r"\1", MD_LINK.sub(r"\1", text[at:])))
+    return "".join(out + [MD_MARKS.sub("", MD_ESCAPE.sub(r"\1", prose))])
+
+
 def rendered(text: str) -> str:
     """The words Markdown renders, line by line: link and image labels without their destinations, HTML tags and
     comments dropped, escapes undone, emphasis and code marks dropped, runs of spaces read as one. `Draft\\:` reads
     `Draft:`, and `do **not** merge`, `do [not](url) merge` and `do <span>not</span> merge` read `do not merge`, so
-    formatting never hides a hold marker (#28, #31) or a finding."""
-    text = HTML_TAG.sub("", MD_AUTOLINK.sub(r"\1", MD_LINK.sub(r"\1", text or "")))
-    return re.sub(r"[ \t]+", " ", MD_MARKS.sub("", MD_ESCAPE.sub(r"\1", text)))
+    formatting never hides a hold marker (#28, #31) or a finding. Code is shown literally, so its contents are kept
+    as they are: a fenced block's lines, and an inline code span such as `<WIP>` (Codex on #35)."""
+    parts, prose, fence, size = [], [], None, 0
+    for line in (text or "").splitlines():
+        opener = FENCE.match(line)
+        if fence is None and opener:
+            parts.append(_rendered_prose("\n".join(prose)))
+            prose, fence, size = [], opener.group(1)[0], len(opener.group(1))
+        elif fence is not None:
+            if opener and opener.group(1)[0] == fence and len(opener.group(1)) >= size and not line[opener.end():].strip():
+                fence = None
+            else:
+                parts.append(line)
+        else:
+            prose.append(line)
+    parts.append(_rendered_prose("\n".join(prose)))
+    return re.sub(r"[ \t]+", " ", "\n".join(parts))
 
 
 def _has_finding(text: str, phrases) -> bool:
