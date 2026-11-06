@@ -85,7 +85,7 @@ def _outside_fences(body: str) -> list[str]:
     example (#22) or a ```not-a-close line (#28) does not end it; an unclosed fence runs to the end."""
     out, fence, fence_size = [], None, 0
     for line in body.splitlines():
-        if opener := re.match(r"^\s*(`{3,}|~{3,})", line):
+        if opener := re.match(r"^[ ]{0,3}(`{3,}|~{3,})", line):
             here = opener.group(1)
             if fence is None:
                 fence, fence_size = here[0], len(here)
@@ -135,6 +135,8 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
     receipts = _receipts(pr)
     if not receipts:
         return None
+    # Preserve structural delimiters until _outside_fences() runs. `rendered()` is the text-normalization of a
+    # hold or finding; its fences must still exist here.
     body = receipts[-1].body.lower()
     # Explicit verdict wins over phrases, but the last one rather than the first: a receipt that repeats its
     # convention before the actual decision should not be judged by the example.
@@ -150,7 +152,7 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
         residue = residue.replace(phrase, " ")
     # Findings anywhere in the receipt beat a clean verdict token: the token is a summary, the list is the
     # evidence that something is left.
-    if _has_finding(residue, policy.finding_phrases):
+    if _has_finding(rendered(residue), policy.finding_phrases):
         return "findings"
     if tokens:
         return tokens[-1]
@@ -160,7 +162,12 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
 def rendered(text: str) -> str:
     """The words Markdown renders: escapes undone, emphasis and code marks dropped (`Draft\\:` reads `Draft:`, and
     `do **not** merge` reads `do not merge`), so formatting never hides a hold marker (#28)."""
-    return MD_MARKS.sub("", MD_ESCAPE.sub(r"\1", text or ""))
+    text = MD_MARKS.sub("", MD_ESCAPE.sub(r"\1", text or ""))
+    # Raw link destinations and HTML syntax are not the words an owner marked on a rendered page. Keep the label
+    # and tag content; discard only the machine-form wrapper, so both an inline-shortpath and inlined hold match.
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"(?i)</?[a-z][^>]*>", "", text)
+    return text
 
 
 def _has_finding(text: str, phrases) -> bool:
@@ -201,11 +208,15 @@ def decide(pr: PR, row_text: str, policy: Policy, now: datetime | None = None) -
         return Decision("WAIT", "mergeability not computed yet")
     if not pr.mergeable:
         return Decision("REPORT", "not mergeable")
+    required = policy.required_checks.get(pr.repo, frozenset())
+    missing = sorted(required - set(pr.checks))
+    if missing:
+        if now - pr.last_push_at >= policy.check_wait:
+            return Decision("REPORT", "required checks never reported: " + ", ".join(missing))
+        return Decision("WAIT", "required checks not yet reported: " + ", ".join(missing))
     if not pr.checks:
         return Decision("WAIT", f"no checks reported on {pr.head_sha[:7]} yet")
     states = {name: s.lower() for name, s in pr.checks.items()}
-    required = policy.required_checks.get(pr.repo, frozenset())
-    missing = sorted(required - set(states))
     if missing:
         if now - pr.last_push_at >= policy.check_wait:
             return Decision("REPORT", "required checks never reported: " + ", ".join(missing))

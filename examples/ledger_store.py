@@ -252,8 +252,8 @@ class Ledger:
                     # a row has 5 cells and clean() turns a "|" in a value into "/", so more cells is a second row;
                     # a cell that only holds a row id (next action "R-002") is not one (Codex on #30)
                     problem = "rows spliced onto one line"
-                elif len(split(line)) < 4:
-                    problem = f"{len(split(line))} cells; an archived row has id, key, closed and proof"
+                elif len(split(line)) < 5:
+                    problem = f"{len(split(line))} cells; an archived row has id, key, closed, proof and last next action"
                 else:
                     continue
                 out.append({"file": archive.name, "line": n, "ids": ids, "problem": problem})
