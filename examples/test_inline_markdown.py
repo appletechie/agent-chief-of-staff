@@ -159,6 +159,23 @@ class ParserRobustness(unittest.TestCase):
             mg.rendered(text)
             self.assertLess(time.monotonic() - start, 2.0, f"{len(text)} chars took too long")
 
+    def test_unclosed_html_constructs_stay_linear(self):
+        # review of #37: "<?" rescanned to the end of the body for every opener (64 KiB took 3 s), and "<!a" and
+        # "<![CDATA[" did the same at a smaller constant. Their closers are now indexed once, like comments.
+        import time
+        for unit in ["<? ", "<!a ", "<![CDATA[ "]:
+            text = unit * (65536 // len(unit))
+            start = time.monotonic()
+            self.assertIsInstance(mg.rendered(text), str)
+            self.assertLess(time.monotonic() - start, 0.25, f"{unit!r} x {len(text) // len(unit)} took too long")
+
+    def test_closed_html_constructs_still_render_as_nothing(self):
+        self.assertEqual(md.render("a<?php echo 1; ?>b"), "ab")
+        self.assertEqual(md.render("a<!DOCTYPE html>b"), "ab")
+        self.assertEqual(md.render("a<![CDATA[ x ]]>b"), "ab")
+        self.assertEqual(md.render("a<?>b"), "a<?>b")
+        self.assertEqual(md.render("a<![CDATA[]]]>b"), "ab")
+
     def test_a_long_label_is_not_link_syntax_but_its_words_show(self):
         label = "do not merge " * 200
         self.assertIn("do not merge", mg.rendered(f"[{label}](https://x.test)"))
@@ -192,6 +209,13 @@ class ReviewedDefects(unittest.TestCase):
         self.assertIn("do not merge", md.render("Rollback: <!-- do not merge --->").lower())
         self.assertIn("do not merge", md.render("<!-->do not merge-->").lower())
         self.assertIn("wip", md.render("<!--->WIP").lower())
+
+    def test_an_autolink_is_not_split_by_link_brackets(self):
+        # inherited, found in the review of #37: autolinks bind tighter than link brackets, so a "]" inside one
+        # cannot close an outside "[". Pairing across it rendered "see <https://x.test/?q=>" and hid "(WIP)".
+        text = "[see <https://x.test/?q=](WIP)>"
+        self.assertIn("(WIP)", md.render(text))
+        self.assertEqual(mg.decide(_pr(text), "", mg.Policy(frozenset()), T0).action, "REPORT")
 
     def test_a_closing_tag_takes_no_attributes(self):
         # inherited: cmark's closetag is "</" name space* ">" only, so "</b wip>" is literal text.

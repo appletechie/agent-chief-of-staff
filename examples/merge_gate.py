@@ -8,10 +8,10 @@ The caller merges only on MERGE, and passes pr.head_sha as the expected head so 
 from __future__ import annotations
 
 import re
-
-import md_inline
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+
+import md_inline
 
 GREEN = {"success", "skipped", "neutral"}
 # A required check must actually run and pass (neutral passes, as on most VCS hosts); skipped is green only

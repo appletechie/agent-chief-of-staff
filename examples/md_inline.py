@@ -23,6 +23,7 @@ bracket can eat a visible one (a false merge). The test suite pins each of them 
 """
 from __future__ import annotations
 
+import bisect
 import html
 import html.entities
 import re
@@ -40,9 +41,8 @@ CLOSE_TAG = re.compile(r"</[A-Za-z][A-Za-z0-9-]*\s*>")
 # text rule rejects a body starting with ">" or "->". Both rejections are the fail-closed direction here -- an
 # ambiguous "comment" then renders literally, so a hold marker inside it stays visible instead of vanishing.
 # cmark: declaration = "<!" ASCIIletter ... ">"; processing instruction = "<? ... ?>"; CDATA = "<![CDATA[ ... ]]>"
-HTML_DECL = re.compile(r"<![A-Za-z][^>]*>", re.S)
-HTML_PI = re.compile(r"<\?.*?\?>", re.S)
-HTML_CDATA = re.compile(r"<!\[CDATA\[.*?\]\]>", re.S)
+# These three are found through _Scan.html_construct_end, which looks their closers up in an index built once, so a
+# body of thousands of unclosed openers is not rescanned to its end for each one.
 BLOCK_TAG = re.compile(r"(?:address|article|aside|blockquote|br|caption|dd|details|dialog|div|dl|dt|fieldset"
                        r"|figcaption|figure|footer|form|h[1-6]|header|hr|li|main|nav|ol|p|pre|section|summary|table"
                        r"|tbody|td|tfoot|th|thead|tr|ul)", re.I)
@@ -88,6 +88,10 @@ class _Scan:
         # The last "-->" in the text: a comment candidate with no closer after it is rejected in O(1) instead of
         # rescanning to the end (a body of 20,000 "<!--" must not be quadratic).
         self.comment_closers = [m.start() for m in re.finditer(r"-->", text)]
+        # The same for processing instructions ("?>"), CDATA ("]]>") and declarations (">").
+        self.pi_closers = [m.start() for m in re.finditer(r"\?>", text)]
+        self.cdata_closers = [m.start() for m in re.finditer(r"(?=\]\]>)", text)]
+        self.gt_positions = [m.start() for m in re.finditer(r">", text)]
         # Backtick runs by length, so a code span's closing run is found by lookup, not by rescanning.
         self.runs: dict[int, list[int]] = {}
         i = 0
@@ -115,6 +119,12 @@ class _Scan:
                 while i < len(text) and text[i] == "`":
                     i += 1
                 continue
+            if c == "<":
+                # An autolink binds tighter than link brackets: a "]" inside one cannot close an outside "[".
+                auto = AUTOLINK_URI.match(text, i + 1) or AUTOLINK_EMAIL.match(text, i + 1)
+                if auto and auto.end() < len(text) and text[auto.end()] == ">":
+                    i = auto.end() + 1
+                    continue
             if c == "[":
                 stack.append(i)
             elif c == "]" and stack:
@@ -122,7 +132,6 @@ class _Scan:
             i += 1
 
     def first_run_at_least(self, length: int, start: int) -> int | None:
-        import bisect
         positions = self.runs.get(length)
         if not positions:
             return None
@@ -144,7 +153,6 @@ class _Scan:
 
     def _first_closer(self, j: int) -> int | None:
         """The first "-->" at or after `j`, by binary search over the closers found in one pass."""
-        import bisect
         k = bisect.bisect_left(self.comment_closers, j)
         if k >= len(self.comment_closers):
             return None
@@ -152,6 +160,23 @@ class _Scan:
         # A comment is short in practice. A longer candidate is treated as prose (fail-closed: its words show), which
         # also keeps a body of thousands of "<!--" from rescanning to the same distant closer.
         return close if close - j <= MAX_COMMENT else None
+
+    def html_construct_end(self, i: int) -> int | None:
+        """The index past a CDATA section, processing instruction or declaration opening at `i` (cmark's grammar:
+        "<![CDATA[" ... "]]>", "<?" ... "?>", "<!" ASCII-letter, no ">", then ">"), or None when none opens here."""
+        text = self.text
+        if text.startswith("<![CDATA[", i):
+            return self._closer_after(self.cdata_closers, i + 9, 3)
+        if text.startswith("<?", i):
+            return self._closer_after(self.pi_closers, i + 2, 2)
+        if text.startswith("<!", i) and i + 2 < len(text) and text[i + 2].isascii() and text[i + 2].isalpha():
+            return self._closer_after(self.gt_positions, i + 3, 1)
+        return None
+
+    @staticmethod
+    def _closer_after(closers: list[int], j: int, width: int) -> int | None:
+        k = bisect.bisect_left(closers, j)
+        return closers[k] + width if k < len(closers) else None
 
     def code_span_end(self, i: int) -> int | None:
         """The index just past a code span that opens at `i`, or None when this run has no matching closer."""
@@ -323,8 +348,12 @@ def render_inline(text: str, defined: frozenset = frozenset(), depth: int = 0) -
                 if end is not None:
                     i = end
                     continue
-            tag = (HTML_CDATA.match(text, i) or HTML_PI.match(text, i) or HTML_DECL.match(text, i)
-                   or OPEN_TAG.match(text, i) or CLOSE_TAG.match(text, i))
+            end = scan.html_construct_end(i)
+            if end is not None:
+                out.append("")
+                i = end
+                continue
+            tag = OPEN_TAG.match(text, i) or CLOSE_TAG.match(text, i)
             if tag:
                 name = re.match(r"</?([A-Za-z][A-Za-z0-9-]*)", tag.group(0))
                 out.append(" " if name and BLOCK_TAG.fullmatch(name.group(1)) else "")
