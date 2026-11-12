@@ -7,10 +7,11 @@ The caller merges only on MERGE, and passes pr.head_sha as the expected head so 
 """
 from __future__ import annotations
 
-import html
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+
+import md_inline
 
 GREEN = {"success", "skipped", "neutral"}
 # A required check must actually run and pass (neutral passes, as on most VCS hosts); skipped is green only
@@ -21,26 +22,11 @@ PENDING = {"queued", "in_progress", "pending", "waiting", "requested"}
 # Row holds are the owner's words: an uppercase token or a fixed phrase, not any prose containing "held".
 ROW_HOLD = re.compile(r"\bHOLD\b|\bHELD\b|(?i:\bon hold\b|\bdo not merge\b|\bdon'?t merge\b)")
 PR_HOLD = re.compile(r"(?i)\bdraft:|\bdraft until\b|\bmerge only after\b|\bdo not merge\b|\bdon'?t merge\b|\bon hold\b|\bwip\b")
-# Markdown that renders a hold marker: backslash escapes (Draft\:) and emphasis or code (do **not** merge) (#28), a
-# link or image whose label carries the words (do [not](url) merge) and inline HTML (do <span>not</span> merge) (#31).
-# The label stays and the destination goes; an autolink <https://...> renders as its address.
-MD_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
-MD_MARKS = re.compile(r"[*_`~]+")
-# An inline link only when its destination is one (no spaces unless in <>, an optional quoted title): "[ready](WIP
-# status)" is not a link and shows as written. A reference link loses its label only when the label is defined:
-# "[ready][WIP]" with no "[WIP]: ..." line shows as written (Codex on #35).
-MD_LINK = re.compile(r"!?\[([^\]]*)\]\(\s*(?:<[^<>\n]*>|[^\s()<>]*)(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^()]*\)))?\s*\)")
-MD_REF_LINK = re.compile(r"!?\[([^\]]*)\]\[([^\]]*)\]")
-MD_REF_DEF = re.compile(r"^ {0,3}\[([^\]]+)\]:[ \t]*\S")
-MD_AUTOLINK = re.compile(r"<([a-z][a-z0-9+.-]*:[^<>\s]*)>", re.I)
-HTML_TAG = re.compile(r"<!--.*?-->|</?([a-z][a-z0-9-]*)(?:\s[^<>]*)?/?>", re.I | re.S)
-# A block-level tag separates what it encloses (<p>WIP</p><p>Ready</p> shows two words), so it reads as a space; an
-# inline tag (<b>, <span>) does not split a word (Codex on #35).
-HTML_BLOCK = re.compile(r"(?:address|article|aside|blockquote|br|dd|details|dialog|div|dl|dt|fieldset|figcaption|figure|footer|form|h[1-6]|header|hr|li|main|nav|ol|p|pre|section|summary|table|tbody|td|tfoot|th|thead|tr|ul)", re.I)
+# Inline Markdown is one CommonMark inline pass in md_inline.py (#36); only block structure lives here.
 # A fence delimiter is indented at most 3 spaces (CommonMark): a "    ```" line inside a fence does not close it (#31).
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-# An inline code span renders its contents literally: `<WIP>` and `<!-- do not merge -->` are visible text (Codex on #35).
-CODE_SPAN = re.compile(r"(`+)(.+?)(?<!`)\1(?!`)", re.S)
+# A link reference definition line, collected from prose only: one inside a code block defines nothing.
+MD_REF_DEF = re.compile(r"^ {0,3}\[([^\]]+)\]:[ \t]*\S")
 # An indented code line (4 spaces or a tab) is an example, like a fenced block (#28).
 INDENTED = re.compile(r"^(?: {4,}|\t)")
 # "Findings: None" (or a Findings heading over "None") says the list is empty (#28).
@@ -177,40 +163,16 @@ def review_verdict(pr: PR, policy: Policy) -> str | None:
     return "clean" if clean else "unparsed"
 
 
-def _ref_label(label: str) -> str:
-    return " ".join(label.split()).lower()
-
-
-def _prose(text: str, defined: frozenset = frozenset()) -> str:
-    """Rendered prose: an escaped character shows as itself (`\\<WIP>` displays `<WIP>`, Codex on #35), so escapes
-    are set aside while link labels lose their destinations and HTML tags and comments go; then emphasis marks go,
-    escaped ones too (`do \\*not\\* merge` still reads as a hold), and HTML entities read as their characters
-    (`do&nbsp;not merge`)."""
-    text = MD_ESCAPE.sub(lambda m: chr(0xF0000 + ord(m.group(1))), text)
-    text = MD_REF_LINK.sub(lambda m: m.group(1) if _ref_label(m.group(2) or m.group(1)) in defined else m.group(0),
-                           MD_LINK.sub(r"\1", text))
-    text = HTML_TAG.sub(lambda m: " " if m.group(1) and HTML_BLOCK.fullmatch(m.group(1)) else "",
-                        MD_AUTOLINK.sub(r"\1", text))
-    text = re.sub("[\U000F0000-\U000F007F]", lambda m: chr(ord(m.group(0)) - 0xF0000), text)
-    return html.unescape(MD_MARKS.sub("", text))
-
-
-def _rendered_prose(text: str, defined: frozenset = frozenset()) -> str:
-    """Prose outside code blocks; an inline code span keeps its contents as they are and loses only the backticks."""
-    out, at = [], 0
-    for span in CODE_SPAN.finditer(text):
-        out += [_prose(text[at:span.start()], defined), span.group(2)]
-        at = span.end()
-    return "".join(out + [_prose(text[at:], defined)])
-
-
 def rendered(text: str) -> str:
-    """The words Markdown renders, line by line: link and image labels without their destinations, HTML tags and
-    comments dropped, escapes undone, emphasis and code marks dropped, runs of spaces read as one. `Draft\\:` reads
-    `Draft:`, and `do **not** merge`, `do [not](url) merge` and `do <span>not</span> merge` read `do not merge`, so
-    formatting never hides a hold marker (#28, #31) or a finding. Code is shown literally, so its contents are kept
-    as they are: a fenced block's lines, an indented code line (4 spaces or a tab) and an inline code span such as
-    `<WIP>` (Codex on #35)."""
+    """The words Markdown renders, block structure then one CommonMark inline pass (#36).
+
+    Block structure stays here, because the gate needs it for other reasons too: fenced blocks (a delimiter indented
+    at most 3 spaces, closing only at a bare delimiter of the same character) and indented code lines stay literal,
+    and link reference definitions count only in prose. Everything inline -- escapes, code spans, autolinks, raw HTML,
+    links and images, entities, emphasis -- goes through `md_inline.render_inline`, which walks the text once in the
+    spec's precedence order instead of layering regexes that kept interacting (an escaped backtick used to swallow a
+    code span's opener and hide a visible `<WIP>`; Codex on #35, #36).
+    """
     chunks, prose, fence, size = [], [], None, 0  # (is_code, text), code kept literal
     for line in (text or "").splitlines():
         opener = FENCE.match(line)
@@ -230,9 +192,26 @@ def rendered(text: str) -> str:
             prose.append(line)
     chunks.append((False, "\n".join(prose)))
     # link reference definitions count only in prose: one inside a code block defines nothing
-    defined = frozenset(_ref_label(m.group(1)) for code, chunk in chunks if not code
+    defined = frozenset(md_inline.ref_label(m.group(1)) for code, chunk in chunks if not code
                         for line in chunk.splitlines() if (m := MD_REF_DEF.match(line)))
-    parts = [chunk if code else _rendered_prose(chunk, defined) for code, chunk in chunks]
+    parts = []
+    for code, chunk in chunks:
+        if code:
+            parts.append(chunk)
+            continue
+        # A link reference definition line stays as written (the fail-closed choice from #35): it is not prose
+        # the reader sees as a link, and hiding it would lose the text an owner wrote.
+        prose_lines = []
+        for line in chunk.splitlines():
+            if MD_REF_DEF.match(line):
+                if prose_lines:
+                    parts.append(md_inline.render("\n".join(prose_lines), defined))
+                parts.append(line)
+                prose_lines = []
+            else:
+                prose_lines.append(line)
+        if prose_lines:
+            parts.append(md_inline.render("\n".join(prose_lines), defined))
     return re.sub(r"[ \t]+", " ", "\n".join(parts))
 
 
