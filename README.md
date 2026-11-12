@@ -109,6 +109,7 @@ Small, dependency-free Python sketches (standard library only, POSIX file locks)
 | [examples/worker-rules.md](examples/worker-rules.md) | The shared worker rules appended to every brief |
 | [examples/test_examples.py](examples/test_examples.py) | Unit tests for the sketches |
 | [examples/test_durability.py](examples/test_durability.py) | Concurrency (threads and processes) and lease-fencing tests |
+| `examples/test_*.py` (the other 16 files) | Focused tests: close gate and proof kinds, identity and path boundaries, dispatch history, review verdicts, receipts, state fields, timer ids, archive recovery |
 
 Run the tests:
 
